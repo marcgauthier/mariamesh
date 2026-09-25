@@ -2,6 +2,36 @@
 
 `mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes, as well as secure, unidirectional **High/Low Air-Gap Replication** across classified and unclassified security domains. It replaces `GALVANIZE`, utilizing Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), explicit MariaDB binary installation path and configuration file inputs with automated enforcement (data-at-rest encryption, FIFO key handshake, engine invariants), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
 
+## GALVANIZE Replacement Contract and Open Decisions
+
+The MariaDB replication engine is only one part of a GALVANIZE replacement. Before declaring parity, inventory deployed GALVANIZE configurations, schemas, SQL queries, Go client calls, stored files, High/Low artifacts, and operator workflows. Record for each capability whether MARIAMESH provides a compatible endpoint, a documented migration, or an explicitly accepted removal. The default release gate is that no used capability is silently lost.
+
+| GALVANIZE capability | Required MARIAMESH plan and acceptance criterion |
+| --- | --- |
+| Application SQL and public API | Provide a MariaDB `database/sql` migration path for the Go client. Decide whether existing PostgreSQL wire and HTTP query/transaction clients need compatibility endpoints; if so, specify supported SQLite-to-MariaDB SQL translation, parameter binding, transaction/error semantics, authentication, and version/watermark responses. Test representative real client queries. Direct MariaDB SQL alone is a breaking client change. |
+| Managed schema | Inventory GALVANIZE schema files, views, indexes, primary keys, defaults, and SQL dialect. Define a repeatable conversion into MariaDB migrations, including view/index updates and online schema rollout. The current mandatory `id` UUIDv5 plus `name` rule excludes ordinary GALVANIZE tables with integer, text, or composite primary keys; choose either a compatible identity model or a documented remapping with foreign-reference and client-query migration. Reject unsupported schemas before cutover. |
+| Streaming and subscriptions | Provide initial snapshot plus ordered changes, end-of-query watermark, resumable query subscriptions, table updates, retention and slow-consumer policy, and reconnect behavior if existing clients use them. A changelog by itself is not a public subscription API. |
+| Encrypted files | Port file upload/download, metadata/search/stats/delete, replicated metadata, encrypted local payloads, peer fetch/cache, and Low-to-High recipient-sealed file transfer. Define key rotation and deletion propagation. Verify files remain readable after migration and remote fetch. |
+| Administration and observability | Provide or migrate health/locked status, local admin socket or CLI, remote mTLS admin commands, membership inspection, forced sync, schema reload, backup/restore, key rotation, Prometheus metrics, and the Go client surfaces used by operators. Document endpoint and command changes. |
+| Templates and Consul | Inventory use of state-driven Rhai config templates and local Consul service registration. Port the required behavior or provide a tested replacement workflow before retiring GALVANIZE. |
+| Network policy | Port peer IP/CIDR allow-list enforcement to inbound and outbound QUIC, gossip, broadcasts, sync, and bootstrap. Test denied peers cannot discover, join, or receive data. |
+| High/Low roles and transport | Specify Low, High, and High-replica behavior; directory, HTTP(S), FTP/FTPS, and SFTP transports documented by GALVANIZE; credentials and SFTP host-key pinning; sequence-gap recovery, replay, waiting-schema, and provenance. Verify which adapters work and are deployed: the direct SFTP functions in `crates/galv-highlow/src/transport.rs` currently return a configuration error. Add S3 only as a new adapter with its own tests. |
+
+### Compatibility boundaries that need explicit decisions
+
+- **Mesh protocol:** `mariamesh-repl/1`, MariaDB CDC events, and HLC/LWW metadata do not interoperate with GALVANIZE's Corrosion/CR-SQLite mesh. Plan a one-time export/import or a versioned bridge; do not add MARIAMESH nodes to a live GALVANIZE mesh without a proven bridge.
+- **High/Low artifacts:** The existing GALVANIZE `schema_hash` is SHA-256 over ordered `sqlite_schema.sql` entries, excluding internal objects. Hashing MariaDB DDL produces a different value even for equivalent tables. Version the new format or define a canonical cross-database schema and row-value mapping. Claim `galvanize-highlow/1` compatibility only after GALVANIZE-to-MARIAMESH and MARIAMESH-to-GALVANIZE golden-vector tests pass for manifests, signatures, values, keys, deletes, schema holds, replay, and file artifacts.
+- **Conflict semantics:** HLC per-field LWW is a new algorithm, not proof of identical CR-SQLite outcomes. Specify tie-breaking, null/blob/JSON encoding, multi-column atomicity, update/delete races, clock skew, and mixed-version behavior; test convergence with the same workloads as GALVANIZE.
+- **Secrets and lifecycle:** Define how the MariaDB encryption key, High/Low keys, and TLS material enter memory without being stored in config, source, logs, or process arguments. Specify locked startup/unlock and offline rekey or a documented operational replacement. If attaching to an already-running MariaDB, verify encryption/plugin state before serving traffic. Back up both MariaDB data and external encrypted file payloads and prove restore.
+- **Current implementation versus target:** The current Go package takes an existing `*sql.DB`, injects a generic logger, and exposes migration SQL for the host to install. It does not yet implement the planned process manager, package-owned DDL, Zap/timberlog logger, or GALVANIZE-facing services. Resolve ownership of DDL and process startup in the public API and update the examples to match the chosen contract; do not present target design as shipped behavior.
+
+### Migration and release gates
+
+1. Build a fixture from a real GALVANIZE deployment: schema, representative rows and blobs, encrypted files, configuration, clients, and pending High/Low bundles. Record counts and hashes without exposing secrets.
+2. Implement an idempotent, resumable export/import with primary-key mapping, SQL type conversion, view/index recreation, file re-encryption, and provenance/High/Low sequence handling. Define a write freeze or dual-write/catch-up cutover, validation, and rollback procedure. Never treat a SQLite database file as a MariaDB data directory.
+3. Run equivalent live scenarios on MariaDB: partitions and heal, concurrent updates/deletes, crash recovery, large blobs, peer allow-list, locked startup/rekey, schema drift, High/Low corruption/replay/gaps, file peer fetch and air-gap delivery, and Go client workflows. Compare logical row and file contents across nodes; byte-identical database files are not a meaningful MariaDB criterion.
+4. Require an operator-reviewed parity matrix and successful restore and rollback rehearsal before replacing the GALVANIZE service in production.
+
 ---
 
 ## Architecture Overview
@@ -154,8 +184,8 @@ Every table configured for replication must satisfy strict structural invariants
     - Decentralized membership with indirect probing, suspicion mechanism, and incarnation numbers.
 
 ### 7. High/Low Unidirectional Air-Gap Replication (Cross-Domain Support)
-- **Full Replacement for Galvanize High/Low**:
-  - Implements complete wire-compatible support for Galvanize High/Low air-gap replication (`galvanize-highlow/1`, `galvanize-highlow-sealed/1`, `galvanize-highlow-manifest/1`).
+- **GALVANIZE High/Low replacement target**:
+  - Target GALVANIZE artifact compatibility for `galvanize-highlow/1`, `galvanize-highlow-sealed/1`, and `galvanize-highlow-manifest/1`, subject to the cross-database schema and value mapping and golden-vector tests above. Otherwise use a new versioned format and migration bridge.
   - Allows lower security domain nodes (e.g. unclassified, branch, or tactical edge) to continuously replicate data to higher security domain nodes (e.g. classified, secret, or central enclaves) across one-way data diodes, file drops, or object storage.
 - **Strong Cryptographic Assurance**:
   - Payloads are compressed with `zstd` (level 15) and symmetrically encrypted using `XChaCha20Poly1305` with an ephemeral 256-bit key and 192-bit nonce.
@@ -758,7 +788,7 @@ func main() {
             AutoStart:     true,
             SocketPath:    "/var/run/mysqld/mysqld.sock",
             FIFODir:       "/var/run/mariamesh",
-            DecryptionKey: []byte("my-secret-encryption-key-32bytes!"),
+            DecryptionKey: decryptionKey, // Loaded from a protected secret source
         },
         Logging: replication.LogConfig{
             LogDir:      "/var/log/mariamesh",
@@ -818,6 +848,9 @@ func main() {
 
 ## Phased Implementation Roadmap
 
+0. **Phase 0: Replacement Inventory and Contract**
+   - Inventory deployed GALVANIZE schemas, clients, services, transports, files, and operating procedures; complete the replacement matrix above.
+   - Choose the schema/identity migration and High/Low format strategy before locking the MARIAMESH public API and metadata schema.
 1. **Phase 1: Identity & Schema Contracts**
    - Implement UUIDv5 generation and validation (`identity.go`).
    - Implement `Table` registry, ensuring mandatory `name` column and rejection of secondary unique indexes.
@@ -849,9 +882,9 @@ func main() {
    - Implement bounded batch streaming with commit-before-ACK invariants.
    - Implement multi-hop store-and-forward mesh propagation.
 8. **Phase 8: High/Low Air-Gap Cryptography & Bundles**
-   - Port Galvanize bundle construction, validation, and SHA-256 `schema_hash` calculation.
+   - Port GALVANIZE bundle construction and validation; resolve the legacy SQLite `schema_hash` mismatch through the versioned mapping and compatibility tests above.
    - Implement Zstd compression, XChaCha20Poly1305 symmetric encryption, RSA-OAEP key wrapping, and Ed25519 manifest signing.
-   - Implement transport adapters: Directory (atomic rename), HTTP(S), SFTP, and S3.
+   - Implement and live-test the GALVANIZE transports actually in use: Directory (atomic rename), HTTP(S), FTP/FTPS, and SFTP as applicable; add S3 separately if required.
 9. **Phase 9: High/Low Exporter, Importer, Provenance & Replay**
    - Implement Low exporter worker polling `replication_highlow_events` and sealing bundles.
    - Implement High importer worker verifying manifests, unsealing bundles, and recording inbox/stream sequences.
@@ -866,3 +899,7 @@ func main() {
     - End-to-end High/Low air-gap ingestion and sparse merge tests.
     - Process restart resilience tests (verifying MariaDB continues running across `mariamesh` restarts).
     - Fuzz testing for QUIC message framing, corrupted packet handling, and bundle unsealing.
+12. **Phase 12: GALVANIZE Service Parity and Cutover**
+    - Complete the replacement matrix, resolve schema/identity and protocol compatibility decisions, and align the public Go API with actual DDL and process ownership.
+    - Implement the client-facing services and operator workflows used by deployed GALVANIZE applications, including subscriptions and encrypted files where inventoried.
+    - Build and exercise the export/import bridge, High/Low golden vectors, live parity scenarios, backup/restore, and rollback rehearsal before production cutover.
