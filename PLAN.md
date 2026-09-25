@@ -1,6 +1,6 @@
 # MARIAMESH: Decentralized Multi-Master & Cross-Domain Replication for MariaDB
 
-`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes, as well as secure, unidirectional **High/Low Air-Gap Replication** across classified and unclassified security domains. It replaces `GALVANIZE`, utilizing Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), automated MariaDB configuration discovery and enforcement (data-at-rest encryption, FIFO key handshake, engine invariants), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
+`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes, as well as secure, unidirectional **High/Low Air-Gap Replication** across classified and unclassified security domains. It replaces `GALVANIZE`, utilizing Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), explicit MariaDB binary installation path and configuration file inputs with automated enforcement (data-at-rest encryption, FIFO key handshake, engine invariants), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
 
 ---
 
@@ -14,7 +14,8 @@ flowchart TD
         MM["mariamesh Package (Go)"]
         
         subgraph MMPkg ["mariamesh Engine"]
-            ConfMgr["MariaDB Config Discovery & Enforcement Engine"]
+            InputVal["Binary Path & Config File Validator"]
+            ConfMgr["MariaDB Config Enforcement Engine"]
             ProcMgr["MariaDB Process Manager & FIFO Key Provisioner"]
             DDLMgr["Package DDL & Schema Migration Engine"]
             ValEngine["Startup Schema & Trigger Validator"]
@@ -26,7 +27,8 @@ flowchart TD
     end
 
     subgraph ConfigStorage ["Host Filesystem & OS"]
-        MdbCnf["MariaDB Config File (my.cnf / mariadb.cnf)"]
+        MdbBin["MariaDB Server Binary (BinaryPath)"]
+        MdbCnf["MariaDB Config File (ConfigFile)"]
         FIFOPipe["Decryption Key Named Pipe (FIFO)"]
         LogFiles["/var/log/mariamesh/mariamesh-YYYY-MM-DD.log"]
     end
@@ -43,8 +45,11 @@ flowchart TD
         PeerB["Peer Node B (QUIC / mTLS)"]
     end
 
-    ConfMgr -- "1. Identify & Enforce Encryption Settings (Edit File)" --> MdbCnf
-    ProcMgr -- "2. Create FIFO & Start Process (Setsid)" --> FIFOPipe
+    InputVal -- "1. Validate Binary & Config File Paths" --> MdbBin
+    InputVal --> MdbCnf
+    ConfMgr -- "2. Enforce Encryption Settings (Edit ConfigFile)" --> MdbCnf
+    ProcMgr -- "3. Create FIFO & Start Binary (Setsid)" --> FIFOPipe
+    MdbBin -. "Spawn Process" .-> MariaDBProc
     MdbCnf -. "Read Enforced Config" .-> MariaDBProc
     FIFOPipe -- "Decryption Key" --> MariaDBProc
     DDLMgr -- "Execute DDL & Install Triggers" --> MariaDBProc
@@ -95,17 +100,18 @@ Every table configured for replication must satisfy strict structural invariants
     $$\text{id} = \text{UUIDv5}(\text{NamespaceUUID}, \text{lower}(\text{tablename}) + \text{":"} + \text{lower}(\text{name}))$$
   - Once inserted, the `id` is **strictly immutable**. Subsequent updates to the `name` column (e.g. renaming an entity) do not regenerate or alter the `id`.
 
-### 3. MariaDB Configuration Discovery, Auto-Enforcement & Process Management
-- **Configuration File Auto-Discovery**:
-  - At startup, `mariamesh` locates the active MariaDB configuration file (`my.cnf`, `/etc/mysql/mariadb.cnf`, drop-in directories, or custom specified path).
+### 3. Explicit Binary & Configuration File Input, Auto-Enforcement & Process Management
+- **Explicit Installation Path of MariaDB Binary & Config File**:
+  - The Go package must be given the explicit filesystem path to the **MariaDB server binary** (`BinaryPath`, e.g. `/usr/sbin/mariadbd`, `/usr/bin/mariadbd`, or custom install location) and its **configuration file** (`ConfigFile`, e.g. `/etc/mysql/mariadb.cnf`, `/etc/my.cnf`).
+  - On startup, `mariamesh` validates that `BinaryPath` exists, is a regular file, and is executable.
 - **Automated Configuration Enforcement**:
-  - `mariamesh` inspects the configuration file to confirm all mandatory settings (data-at-rest encryption, FIFO key management plugin, InnoDB settings, character encoding, and replication invariants) are properly configured.
-  - If any required directive is missing, invalid, or incompatible, `mariamesh` **automatically edits and updates the configuration file** (creating a backup before writing) to enforce the required settings.
+  - `mariamesh` inspects the given configuration file to confirm all mandatory settings (data-at-rest encryption, FIFO key management plugin, InnoDB settings, character encoding, and replication invariants) are properly configured.
+  - If any required directive is missing, invalid, or incompatible, `mariamesh` **automatically edits and updates the configuration file** (creating a timestamped backup before writing) to enforce the required settings.
 - **MariaDB Process Management & FIFO Key Decryption**:
   - `mariamesh` controls when MariaDB starts. If MariaDB is not running:
     1. Creates a secure POSIX named pipe (FIFO file, `mkfifo` with mode `0600`) at a designated path.
     2. Spawns a background goroutine to write the data-at-rest decryption key into the FIFO pipe for MariaDB's `file_key_management` plugin.
-    3. Launches the MariaDB process (`mariadbd` / `mysqld`) as a detached, independent OS process (`Setsid: true` / independent process group).
+    3. Launches the MariaDB binary (`BinaryPath`) using `ConfigFile` as a detached, independent OS process (`Setsid: true` / independent process group).
     4. MariaDB consumes the key, unlocks tablespaces, and finishes startup.
     5. **Process Persistence**: MariaDB continues running as a normal independent daemon even if `mariamesh` stops or restarts.
     6. `mariamesh` polls the database connection until MariaDB is fully ready.
@@ -127,7 +133,7 @@ Every table configured for replication must satisfy strict structural invariants
 ### 5. Unified Logging with Zap and timberlog (Daily 00:00 UTC Rotation & 30d Retention)
 - **Centralized Structured Logger**:
   - Logging is built using Uber's **Zap** (`go.uber.org/zap`) coupled with **`timberlog`** (time-based rolling write syncer).
-  - All logs across every internal subsystem (Config Enforcement, Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, High/Low Workers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
+  - All logs across every internal subsystem (Path Validator, Config Enforcement, Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, High/Low Workers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
 - **File Rotation & Retention Rules**:
   - **Storage Directory**: Configurable folder (e.g. `/var/log/mariamesh` or configured path).
   - **Daily Rotation at 00:00 UTC (`0000 UTC`)**: Log files rotate exactly at midnight UTC daily.
@@ -166,55 +172,44 @@ Every table configured for replication must satisfy strict structural invariants
 
 ---
 
-## MariaDB Configuration Discovery & Auto-Enforcement
+## MariaDB Binary & Configuration File Input & Auto-Enforcement
 
 ```mermaid
 flowchart TD
-    Start([Package Startup]) --> LocateConfig[Locate Configuration File]
+    Start([Package Startup]) --> ValidateInputs[Validate BinaryPath & ConfigFile Inputs]
     
-    subgraph DiscoveryChain ["1. Configuration Discovery Chain"]
-        LocateConfig --> CheckExplicit{ProcessConfig.ConfigFile specified?}
-        CheckExplicit -- Yes --> UseExplicit[Use Specified Config File]
-        CheckExplicit -- No --> ProbeKnownPaths{Check Known Paths:\n/etc/mysql/mariadb.cnf\n/etc/mysql/my.cnf\n/etc/my.cnf\n/etc/mariadb.cnf}
-        ProbeKnownPaths -- Found --> UseKnown[Use Discovered Path]
-        ProbeKnownPaths -- Not Found --> BinaryIntrospect[Run 'mariadbd --help --verbose'\nParse Default Options Files]
-        BinaryIntrospect --> UseIntrospect[Use Introspected Path]
+    subgraph InputValidation ["1. Input Verification"]
+        ValidateInputs --> CheckBin{BinaryPath exists & executable?}
+        CheckBin -- No --> ErrBin[Error: Invalid MariaDB Binary Path]
+        CheckBin -- Yes --> CheckCnf{ConfigFile exists or creatable?}
+        CheckCnf -- No --> ErrCnf[Error: Invalid Config File Path]
+        CheckCnf -- Yes --> ReadINI[Read & Parse ConfigFile (INI)]
     end
 
-    UseExplicit --> ReadINI
-    UseKnown --> ReadINI
-    UseIntrospect --> ReadINI
-
     subgraph InspectionEnforcement ["2. Inspection & Auto-Enforcement"]
-        ReadINI[Read & Parse INI Configuration] --> CheckSettings{Are all required settings\npresent and valid?}
+        ReadINI --> CheckSettings{Are all required settings\npresent and valid in ConfigFile?}
         
         CheckSettings -- Yes --> Verified[Config Verified OK]
-        CheckSettings -- No --> BackupConfig[Create Timestamped Backup\n*.cnf.bak.YYYYMMDDHHMMSS]
+        CheckSettings -- No --> BackupConfig[Create Timestamped Backup\nConfigFile.bak.YYYYMMDDHHMMSS]
         BackupConfig --> EditINI[Update/Insert Required Directives under [mariadb]/[mysqld]]
         EditINI --> WriteAtomic[Atomic Temp File Write & Rename (chmod 0644)]
         WriteAtomic --> Reverify[Re-parse and Verify INI]
         Reverify --> Verified
     end
 
+    ErrBin --> FailFast([Abort Startup: ErrConfig])
+    ErrCnf --> FailFast
     Verified --> ProcStart[Proceed to MariaDB Process Startup & FIFO Key Handshake]
 ```
 
-### 1. Discovery Precedence Chain
-`mariamesh` searches for the MariaDB configuration file in the following order:
-1. `ProcessConfig.ConfigFile` (explicitly configured path).
-2. Standard Linux/Unix system locations:
-   - `/etc/mysql/mariadb.cnf`
-   - `/etc/mysql/my.cnf`
-   - `/etc/my.cnf`
-   - `/etc/mariadb.cnf`
-   - `/usr/local/etc/my.cnf`
-   - `~/.my.cnf`
-3. Include directories (if `!includedir /etc/mysql/mariadb.conf.d/` or similar is active, `mariamesh` manages a dedicated drop-in file `99-mariamesh.cnf`).
-4. MariaDB binary introspection: Executes `<BinaryPath> --help --verbose` and parses the `Default options are read from the following files in the given order:` section.
+### 1. Mandatory Application Configuration Inputs
+The host application must explicitly specify:
+- **`ProcessConfig.BinaryPath`**: Absolute path to the MariaDB server binary (e.g. `/usr/sbin/mariadbd`, `/usr/bin/mariadbd`, or `/opt/mariadb/bin/mariadbd`).
+- **`ProcessConfig.ConfigFile`**: Absolute path to the MariaDB configuration file (e.g. `/etc/mysql/mariadb.cnf`, `/etc/my.cnf`, or `/opt/mariadb/etc/my.cnf`).
 
 ### 2. Mandatory Settings Enforced by `mariamesh`
 
-`mariamesh` inspects the active configuration and automatically enforces the following settings in the `[mariadb]`, `[mysqld]`, or `[server]` sections:
+`mariamesh` inspects the specified `ConfigFile` and automatically enforces the following settings in the `[mariadb]`, `[mysqld]`, or `[server]` sections:
 
 ```ini
 [mariadb]
@@ -243,11 +238,10 @@ max_allowed_packet = 64M
 ```
 
 ### 3. Safe Configuration File Editing Mechanics
-- **Backup Before Modification**: Before any change is made to an existing configuration file, `mariamesh` creates a backup copy:
-  $$\text{target.cnf} \longrightarrow \text{target.cnf.bak.}\langle\text{timestamp}\rangle$$
+- **Backup Before Modification**: Before any change is made to the specified `ConfigFile`, `mariamesh` creates a backup copy:
+  $$\text{ConfigFile} \longrightarrow \text{ConfigFile.bak.}\langle\text{timestamp}\rangle$$
 - **Preserve Existing Directives & Comments**: The parser updates existing keys or appends missing keys while preserving all comments and unrelated user configurations.
-- **Atomic File Writing**: Writes the updated configuration to a temporary file in the same directory (`.target.cnf.tmp`), sets permissions (`0644`), and performs an atomic POSIX `rename` over the original file.
-- **Drop-In Preference**: If a drop-in configuration directory exists (e.g. `/etc/mysql/mariadb.conf.d/`), `mariamesh` writes its directives directly to `99-mariamesh.cnf`, ensuring clean separation from system package-managed files.
+- **Atomic File Writing**: Writes the updated configuration to a temporary file in the same directory (`.ConfigFile.tmp`), sets permissions (`0644`), and performs an atomic POSIX `rename` over the original file.
 
 ---
 
@@ -257,13 +251,14 @@ max_allowed_packet = 64M
 sequenceDiagram
     autonumber
     participant Host as mariamesh Go Package
-    participant Conf as MariaDB Config File (my.cnf)
+    participant Conf as MariaDB Config File (ConfigFile)
     participant FIFO as POSIX Named Pipe (FIFO)
-    participant MDB as MariaDB Server Process (mariadbd)
+    participant MDB as MariaDB Server Process (BinaryPath)
 
-    Host->>Conf: Locate configuration file & verify required settings
+    Host->>Host: Validate BinaryPath & ConfigFile inputs
+    Host->>Conf: Inspect ConfigFile & verify required settings
     opt Missing or invalid encryption/engine settings
-        Host->>Conf: Create backup & edit configuration file (Enforce encryption/FIFO)
+        Host->>Conf: Create backup & edit ConfigFile (Enforce encryption/FIFO)
     end
     Host->>Host: Check if MariaDB is running (Socket/PID/TCP)
     alt MariaDB is already running
@@ -271,7 +266,7 @@ sequenceDiagram
     else MariaDB is not running
         Host->>FIFO: Create FIFO (mkfifo 0600)
         Host->>FIFO: Spawn background goroutine to write decryption key
-        Host->>MDB: Start mariadbd process (Setsid: true, independent process group)
+        Host->>MDB: Start BinaryPath process with --defaults-file=ConfigFile (Setsid: true)
         MDB->>Conf: Read enforced configuration (file_key_management)
         MDB->>FIFO: Read decryption key from FIFO named pipe
         FIFO-->>Host: Goroutine completes write & closes pipe
@@ -367,7 +362,8 @@ When a Low change event is applied on High:
 ```mermaid
 flowchart TD
     subgraph Subsystems ["mariamesh Subsystems"]
-        Conf["Config Discovery & Enforcer"]
+        InputCheck["Binary & Config Validator"]
+        Conf["Config Enforcer"]
         Proc["Process Manager"]
         DDL["DDL & Schema Validator"]
         Transport["Corrosion QUIC Transport"]
@@ -390,6 +386,7 @@ flowchart TD
         Retain["30-Day Retention Cleaner (Prune > 30d)"]
     end
 
+    InputCheck --> ZapCore
     Conf --> ZapCore
     Proc --> ZapCore
     DDL --> ZapCore
@@ -495,8 +492,7 @@ CREATE TABLE IF NOT EXISTS replication_progress (
     origin_node_id BINARY(16) NOT NULL,
     origin_incarnation_id BINARY(16) NOT NULL,
     contiguous_seq BIGINT UNSIGNED NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (receiver_node_id, receiver_incarnation_id, origin_node_id, origin_incarnation_id)
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
 -- 8. Bootstrap Seeding & GC Retention Pins
@@ -644,7 +640,7 @@ mariamesh/
 │   │   └── worker/           # Background exporter & importer loops
 │   ├── logger/               # Unified Zap + timberlog rolling file engine (00:00 UTC, 30d)
 │   ├── process/              # MariaDB Process Manager, Config Enforcer & FIFO key handshake
-│   │   ├── config_discovery.go # Locates my.cnf / mariadb.cnf / drop-in directories
+│   │   ├── validate_paths.go   # Validates BinaryPath (executable) and ConfigFile
 │   │   ├── config_enforce.go   # Parses INI, updates required settings & writes backup
 │   │   ├── daemon.go           # Detached OS process spawning (Setsid) & PID monitoring
 │   │   └── fifo.go             # POSIX named pipe key writer goroutine
@@ -675,15 +671,13 @@ import (
 
 // ProcessConfig controls the MariaDB daemon lifecycle, configuration enforcement, and key handshake.
 type ProcessConfig struct {
-    AutoStart         bool          // Auto-start MariaDB if not running
-    AutoEnforceConfig bool          // Auto-discover, validate, and edit MariaDB config file
-    BinaryPath        string        // Path to mariadbd/mysqld binary
-    ConfigFile        string        // Path to my.cnf / mariadb.cnf (auto-discovered if empty)
-    ConfigDropInDir   string        // Drop-in directory for 99-mariamesh.cnf (e.g. /etc/mysql/mariadb.conf.d)
-    SocketPath        string        // Path to UNIX domain socket
-    FIFODir           string        // Directory for key FIFO named pipe
-    DecryptionKey     []byte        // Encryption key for file_key_management
-    StartupTimeout    time.Duration // Max time to wait for DB readiness
+    BinaryPath        string        // Required: Absolute path to mariadbd/mysqld binary (e.g. "/usr/sbin/mariadbd")
+    ConfigFile        string        // Required: Absolute path to my.cnf/mariadb.cnf (e.g. "/etc/mysql/mariadb.cnf")
+    AutoStart         bool          // Auto-start MariaDB if not running (default: true)
+    SocketPath        string        // Path to UNIX domain socket (e.g. "/var/run/mysqld/mysqld.sock")
+    FIFODir           string        // Directory for key FIFO named pipe (e.g. "/var/run/mariamesh")
+    DecryptionKey     []byte        // Required: Encryption key for file_key_management
+    StartupTimeout    time.Duration // Max time to wait for DB readiness (default: 30s)
 }
 
 // LogConfig configures the unified Zap + timberlog logger.
@@ -737,6 +731,89 @@ func (r *Replicator) AlterTable(ctx context.Context, table Table, ddlSQL string)
 func (r *Replicator) Validate(ctx context.Context) error
 ```
 
+### Host Application Integration Example
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "github.com/google/uuid"
+    "go.uber.org/zap/zapcore"
+    "github.com/marcgauthier/mariamesh"
+)
+
+func main() {
+    ctx := context.Background()
+    namespace := uuid.MustParse("e0a5c43d-5f3e-4b92-8db7-658b09332e12")
+    nodeID := uuid.New()
+    incarnationID := uuid.New()
+
+    r, err := replication.New(replication.Config{
+        Process: replication.ProcessConfig{
+            // Explicitly specify binary installation path and configuration file
+            BinaryPath:    "/usr/sbin/mariadbd",
+            ConfigFile:    "/etc/mysql/mariadb.cnf",
+            AutoStart:     true,
+            SocketPath:    "/var/run/mysqld/mysqld.sock",
+            FIFODir:       "/var/run/mariamesh",
+            DecryptionKey: []byte("my-secret-encryption-key-32bytes!"),
+        },
+        Logging: replication.LogConfig{
+            LogDir:      "/var/log/mariamesh",
+            MaxSizeMB:   100,             // Default 100MB per file
+            MaxAgeDays:  30,              // 30-day retention
+            RotateUTC:   "00:00",          // Rotate daily at 00:00 UTC
+            Level:       zapcore.InfoLevel,
+            Development: false,
+        },
+        NodeID:        nodeID,
+        IncarnationID: incarnationID,
+        Namespace:     namespace,
+        ListenAddr:    ":7443",
+        TLSConfig:     tlsConfig,
+    })
+    if err != nil {
+        log.Fatalf("Failed to initialize replicator: %v", err)
+    }
+
+    // Controls DDL creation and installs CDC triggers
+    err = r.CreateTable(ctx, replication.Table{
+        Name:       "device",
+        IDColumn:   "id",
+        NameColumn: "name",
+        Columns: []replication.Column{
+            {Name: "location", Type: "VARCHAR(255)"},
+            {Name: "ip_address", Type: "VARCHAR(45)"},
+        },
+    })
+    if err != nil {
+        log.Fatalf("DDL creation failed: %v", err)
+    }
+
+    // Start enforces ConfigFile settings, launches MariaDB BinaryPath (if not running), validates schemas, and starts mesh
+    if err := r.Start(ctx); err != nil {
+        log.Fatalf("Replication start failed: %v", err)
+    }
+    defer r.Close()
+
+    // Application performs direct DML SQL queries against MariaDB
+    db := r.DB()
+    deviceID := replication.ID(namespace, "device", "Router-01")
+
+    _, err = db.ExecContext(ctx, `
+        INSERT INTO device (id, name, location, ip_address) 
+        VALUES (?, ?, ?, ?)
+    `, deviceID, "Router-01", "Ottawa", "192.168.1.1")
+    if err != nil {
+        log.Fatalf("Direct application insert failed: %v", err)
+    }
+
+    select {} // Run service
+}
+```
+
 ---
 
 ## Phased Implementation Roadmap
@@ -748,8 +825,8 @@ func (r *Replicator) Validate(ctx context.Context) error
    - Implement Zap core integration with `timberlog` rolling write syncer.
    - Configure daily rotation at 00:00 UTC, default 100MB file size, and 30-day retention pruning.
    - Route all package subsystem log emitters into the unified logger.
-3. **Phase 3: MariaDB Config Auto-Discovery, Enforcement & Process Manager**
-   - Implement configuration file discovery (`ProcessConfig.ConfigFile`, standard paths, binary introspection).
+3. **Phase 3: MariaDB Binary & Config Validation, Enforcement & Process Manager**
+   - Implement verification of explicit `ProcessConfig.BinaryPath` (executable file check) and `ProcessConfig.ConfigFile`.
    - Implement INI parsing, backup creation, and automated file editing/enforcement (encryption, FIFO plugin, InnoDB invariants).
    - Implement MariaDB running detection (PID, UNIX socket, TCP probe).
    - Implement FIFO creation (`mkfifo 0600`) and background key writer goroutine.
