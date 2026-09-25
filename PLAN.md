@@ -1,6 +1,6 @@
-# MARIAMESH: Decentralized Multi-Master Replication for MariaDB
+# MARIAMESH: Decentralized Multi-Master & Cross-Domain Replication for MariaDB
 
-`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes. It utilizes Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
+`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes, as well as secure, unidirectional **High/Low Air-Gap Replication** across classified and unclassified security domains. It replaces `GALVANIZE`, utilizing Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
 
 ---
 
@@ -8,58 +8,50 @@
 
 ```mermaid
 flowchart TD
-    subgraph HostApp ["Host Application Process"]
-        AppLogic["Application Business Logic"]
-        SQLConn["Direct SQL (DML: INSERT / UPDATE / DELETE / SELECT)"]
-        MM["mariamesh Package (Go)"]
+    subgraph LowDomain ["Low-Security Domain (e.g. Field / Unclassified Node)"]
+        LowApp["Low Host App"]
+        LowDB[("MariaDB (Low)")]
+        LowTrig["CDC Triggers"]
+        LowJournal[("replication_highlow_events")]
+        LowExporter["mariamesh High/Low Exporter"]
+        LowSealer["Crypto Sealer (Zstd + XChaCha20 + RSA-OAEP + Ed25519)"]
+        LowReplay["Replay Worker Engine"]
+
+        LowApp --> LowDB
+        LowDB --> LowTrig
+        LowTrig --> LowJournal
+        LowJournal --> LowExporter
+        LowExporter --> LowSealer
+        LowReplay --> LowSealer
+    end
+
+    subgraph AirgapTransport ["Unidirectional Air-Gap / Cross-Domain Transport"]
+        Diode["Data Diode / File Staging / HTTP(S) / SFTP / S3"]
+        Artifacts["Sealed Bundle Pair:
+        1. Payload: *.zstd.galvh (Encrypted & Compressed)
+        2. Manifest: *.json.galv (Ed25519 Signed)"]
         
-        subgraph MMPkg ["mariamesh Engine"]
-            ProcMgr["MariaDB Process Manager & FIFO Key Provisioner"]
-            DDLMgr["Package DDL & Schema Migration Engine"]
-            ValEngine["Startup Schema & Trigger Validator"]
-            CorrosionTrans["Corrosion P2P Transport (quic-go + SWIM Gossip)"]
-            SyncEngine["State Sync & CRDT Apply Engine"]
-            HLCClock["Hybrid Logical Clock (HLC)"]
-            Logger["Unified Logger (Zap + timberlog)"]
-        end
+        LowSealer --> Diode
+        Diode --> Artifacts
     end
 
-    subgraph LogStorage ["Rotated File Logging (00:00 UTC / 30d Retention)"]
-        LogFiles["/var/log/mariamesh/mariamesh-YYYY-MM-DD.log"]
+    subgraph HighDomain ["High-Security Domain (e.g. Central / Classified Enclave)"]
+        Artifacts --> HighReceiver
+        HighReceiver["mariamesh High/Low Receiver"]
+        HighVerifier["Verifier & Decryptor (Ed25519 + RSA-OAEP + Zstd)"]
+        HighInbox[("replication_highlow_inbox & streams")]
+        HighApply["Sparse Merge & Provenance Engine"]
+        HighProv[("replication_highlow_provenance")]
+        HighDB[("MariaDB (High)")]
+        HighMesh["mariamesh Intra-Cluster Mesh (QUIC)"]
+
+        HighReceiver --> HighVerifier
+        HighVerifier --> HighInbox
+        HighInbox --> HighApply
+        HighProv <--> HighApply
+        HighApply --> HighDB
+        HighDB --> HighMesh
     end
-
-    subgraph MariaDBProc ["MariaDB Server Process (Independent Daemon)"]
-        FIFOPipe["Decryption Key Named Pipe (FIFO)"]
-        InnoDB["InnoDB Encrypted Tablespaces"]
-        AppTables["Replicated Tables (id = UUIDv5, name)"]
-        Triggers["CDC Triggers (_repl_insert, _repl_update, _repl_delete)"]
-        MetaTables["Replication Metadata & Changelog Tables"]
-    end
-
-    subgraph Mesh ["Peer-to-Peer Mesh Network"]
-        PeerA["Peer Node A (QUIC / mTLS)"]
-        PeerB["Peer Node B (QUIC / mTLS)"]
-    end
-
-    ProcMgr -- "1. Create FIFO & Start Process (Setsid)" --> FIFOPipe
-    FIFOPipe -- "Decryption Key" --> MariaDBProc
-    DDLMgr -- "Execute DDL & Install Triggers" --> MariaDBProc
-    ValEngine -- "Validate Tables, Triggers & PK/Constraints" --> MariaDBProc
-    AppLogic -- "Normal Application Queries" --> SQLConn
-    SQLConn --> AppTables
-    AppTables -- "Fire CDC Triggers" --> Triggers
-    Triggers -- "Atomic Changelog Write" --> MetaTables
-    SyncEngine -- "Read & Apply Changes (@replication_apply=1)" --> MetaTables
-    SyncEngine <--> CorrosionTrans
-    CorrosionTrans <--> PeerA
-    CorrosionTrans <--> PeerB
-
-    ProcMgr -.-> Logger
-    DDLMgr -.-> Logger
-    ValEngine -.-> Logger
-    CorrosionTrans -.-> Logger
-    SyncEngine -.-> Logger
-    Logger --> LogFiles
 ```
 
 ---
@@ -75,7 +67,7 @@ flowchart TD
   - No SQL proxy, connection interceptor, or query rewriting layer is placed in front of day-to-day CRUD operations.
 - **Transparent Database-Level Statement Interception**:
   - Database-level triggers (`_repl_insert`, `_repl_update`, `_repl_delete`) installed by `mariamesh` automatically intercept local application DML writes inside MariaDB.
-  - Triggers extract modified columns into JSON payloads, assign a transactional local sequence number, record HLC timestamps, and append changelog records into `replication_log` atomically within the application's transaction.
+  - Triggers extract modified columns into JSON payloads, assign a transactional local sequence number, record HLC timestamps, and append changelog records into `replication_log` (and `replication_highlow_events` if Low role is active) atomically within the application's transaction.
 
 ### 2. Table Schema Constraints & Identity Contract
 Every table configured for replication must satisfy strict structural invariants:
@@ -119,7 +111,7 @@ Every table configured for replication must satisfy strict structural invariants
 ### 5. Unified Logging with Zap and timberlog (Daily 00:00 UTC Rotation & 30d Retention)
 - **Centralized Structured Logger**:
   - Logging is built using Uber's **Zap** (`go.uber.org/zap`) coupled with **`timberlog`** (time-based rolling write syncer).
-  - All logs across every internal subsystem (Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
+  - All logs across every internal subsystem (Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, High/Low Workers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
 - **File Rotation & Retention Rules**:
   - **Storage Directory**: Configurable folder (e.g. `/var/log/mariamesh` or configured path).
   - **Daily Rotation at 00:00 UTC (`0000 UTC`)**: Log files rotate exactly at midnight UTC daily.
@@ -139,6 +131,120 @@ Every table configured for replication must satisfy strict structural invariants
   - **SWIM-based Gossip Membership (Porting Rust `Foca` to Go)**:
     - Decentralized membership with indirect probing, suspicion mechanism, and incarnation numbers.
 
+### 7. High/Low Unidirectional Air-Gap Replication (Cross-Domain Support)
+- **Full Replacement for Galvanize High/Low**:
+  - Implements complete wire-compatible support for Galvanize High/Low air-gap replication (`galvanize-highlow/1`, `galvanize-highlow-sealed/1`, `galvanize-highlow-manifest/1`).
+  - Allows lower security domain nodes (e.g. unclassified, branch, or tactical edge) to continuously replicate data to higher security domain nodes (e.g. classified, secret, or central enclaves) across one-way data diodes, file drops, or object storage.
+- **Strong Cryptographic Assurance**:
+  - Payloads are compressed with `zstd` (level 15) and symmetrically encrypted using `XChaCha20Poly1305` with an ephemeral 256-bit key and 192-bit nonce.
+  - The ephemeral key is wrapped using `RSA-OAEP` (SHA-256) with the High recipient's public key.
+  - The manifest envelope is cryptographically signed using `Ed25519` by the Low sender.
+- **Sparse Merge & High-Ownership Provenance**:
+  - On the High node, local modifications to Low-origin rows are tracked in `replication_highlow_provenance`.
+  - When subsequent Low updates arrive for that row, High executes a **sparse merge**: updating columns that High has not modified, but strictly **preserving High-owned columns**.
+- **Durable Replay & Disaster Recovery**:
+  - Low maintains a durable sequence journal (`replication_highlow_events`).
+  - High or administrators can trigger replay jobs (`ReplayScope::All` or `ReplayScope::Since(UTC)`) without disrupting scheduled export watermarks.
+- **Isolated mTLS Control API**:
+  - High and Low expose a dedicated mTLS REST API for status reporting, replay orchestration, and provenance inspection.
+
+---
+
+## High/Low Air-Gap Replication Subsystem
+
+### 1. Sealing & Manifest Cryptography
+
+```mermaid
+flowchart TD
+    subgraph LowSealing ["Low-Side Sealing Pipeline"]
+        Events["Batch of Change Events (<= 100,000)"]
+        Schema["Compute SHA-256 schema_hash"]
+        Bundle["Construct Bundle (JSON Envelope)"]
+        Compress["Compress with zstd (Level 15)"]
+        GenKey["Generate Ephemeral 256-bit Key & 192-bit Nonce"]
+        SymEncrypt["Encrypt Compressed Payload with XChaCha20Poly1305"]
+        RSAWrap["Wrap Ephemeral Key with High RSA-OAEP Public Key"]
+        PayloadFile["Write *.zstd.galvh Payload"]
+        CreateManifest["Construct Manifest (Digests, Key IDs, Filenames)"]
+        EdSign["Sign Manifest with Low Ed25519 Private Key"]
+        ManifestFile["Write *.json.galv Signed Manifest"]
+
+        Events --> Bundle
+        Schema --> Bundle
+        Bundle --> Compress
+        Compress --> SymEncrypt
+        GenKey --> SymEncrypt
+        GenKey --> RSAWrap
+        SymEncrypt --> PayloadFile
+        RSAWrap --> PayloadFile
+        PayloadFile --> CreateManifest
+        CreateManifest --> EdSign
+        EdSign --> ManifestFile
+    end
+
+    subgraph HighUnsealing ["High-Side Unsealing Pipeline"]
+        FetchPair["Fetch *.json.galv & *.zstd.galvh from Transport"]
+        VerifyEd["Verify Low Ed25519 Signature on Manifest"]
+        RSADecrypt["Unwrap Ephemeral Key with High RSA Private Key"]
+        SymDecrypt["Decrypt Payload with XChaCha20Poly1305"]
+        Decompress["Decompress with zstd"]
+        VerifySchema["Verify schema_hash against Local MariaDB Schema"]
+        ApplyEngine["Apply Events with Provenance Masking"]
+
+        FetchPair --> VerifyEd
+        VerifyEd --> RSADecrypt
+        RSADecrypt --> SymDecrypt
+        SymDecrypt --> Decompress
+        Decompress --> VerifySchema
+        VerifySchema --> ApplyEngine
+    end
+```
+
+### Wire Format Constants
+- `BUNDLE_FORMAT`: `galvanize-highlow/1`
+- `SEALED_FORMAT`: `galvanize-highlow-sealed/1`
+- `MANIFEST_FORMAT`: `galvanize-highlow-manifest/1`
+- `MAX_MANIFEST_BYTES`: `64 KB`
+- `MAX_PAYLOAD_BYTES`: `64 MB`
+- `MAX_DECOMPRESSED_BYTES`: `64 MB`
+- `MAX_EVENTS_PER_BUNDLE`: `100,000`
+- `MAX_VALUE_BYTES`: `4 MB`
+
+### 2. High-Side Sparse Merge & Provenance Protection
+
+When a Low change event is applied on High:
+
+1. **Check Provenance**:
+   - Query `replication_highlow_provenance` for `(table_name, primary_key_json)`.
+   - Retrieve `high_owned_fields_json` (set of columns previously modified directly on High).
+2. **Column Masking**:
+   - For an `UPSERT`:
+     - Low-provided values are applied to all columns **except** those in `high_owned_fields_json`.
+     - High-owned columns retain their current values in MariaDB.
+   - For a `DELETE`:
+     - If the row has High-owned fields, High may optionally preserve the row as a High-local entity or delete it according to configured domain policy.
+3. **Tracking High Overrides**:
+   - When an application executes a direct `UPDATE` on High for a row with `low_origin = true`, the database triggers update `replication_highlow_provenance`, appending the modified column names to `high_owned_fields_json` and updating `last_high_override_at_ms`.
+
+### 3. Transport Adapters
+`mariamesh` provides modular, robust transport adapters for cross-domain transfer:
+
+| Transport Kind | Usage / Air-Gap Compatibility | Key Mechanics |
+| :--- | :--- | :--- |
+| **Directory / Filesystem** | Local shared storage, USB/optical media drops, unidirectional data diodes | Writes to `.partial` temp file first, then executes atomic filesystem rename. |
+| **HTTP / HTTPS** | Networked cross-domain proxies or REST upload servers | HTTP `PUT` / `POST` with Bearer token or mTLS authentication. |
+| **SFTP / FTPS / FTP** | Legacy secure file transfer gateways | SSH key / password authenticated remote file staging. |
+| **S3 / Object Store** | Cloud or on-prem S3-compatible buckets (AWS, MinIO) | Multipart / single PUT with MD5 checksum verification. |
+
+### 4. Dedicated mTLS Control API
+Low and High nodes run an isolated, lightweight HTTP server protected by mutual TLS (client and server certificates validated against configured CAs):
+
+- `GET /v1/highlow/status`: Returns current worker state (`running`, `idle`), pending unexported event count, latest export result, latest import result, and active replay job summary.
+- `POST /v1/highlow/replay`: (Low-only) Enqueues an asynchronous historical replay job.
+  - Body: `{"scope": "all"}` or `{"scope": "since", "since_utc": "2026-09-20T00:00:00Z"}`.
+- `GET /v1/highlow/replay/status`: (Low-only) Returns the current active replay job and the latest 200 audit log entries.
+- `POST /v1/highlow/provenance`: (High-only) Accepts a list of `{table, primary_key}` pairs and returns their origin status (`low_origin: true/false`), stream ID, and `high_owned_fields`.
+
 ---
 
 ## Unified Logging Architecture: Zap & timberlog
@@ -151,6 +257,8 @@ flowchart TD
         Transport["Corrosion QUIC Transport"]
         Gossip["SWIM Gossip Engine"]
         Sync["Delta Sync & Apply Engine"]
+        HighLowExp["High/Low Exporter & Replay"]
+        HighLowImp["High/Low Importer & Provenance"]
         GC["Garbage Collector"]
         Seed["Snapshot Seeder"]
     end
@@ -161,7 +269,7 @@ flowchart TD
     end
 
     subgraph Storage ["Log Storage & Rotation"]
-        DailyFile["/var/log/mariamesh/mariamesh-2026-09-25.log"]
+        DailyFile["/var/log/mariamesh/mariamesh-YYYY-MM-DD.log"]
         Rotator["Rotation Trigger (00:00 UTC or 100MB)"]
         Retain["30-Day Retention Cleaner (Prune > 30d)"]
     end
@@ -171,6 +279,8 @@ flowchart TD
     Transport --> ZapCore
     Gossip --> ZapCore
     Sync --> ZapCore
+    HighLowExp --> ZapCore
+    HighLowImp --> ZapCore
     GC --> ZapCore
     Seed --> ZapCore
 
@@ -180,79 +290,16 @@ flowchart TD
     Retain --> DailyFile
 ```
 
-### Logging Configuration & Implementation Details
-- **`timberlog` Rolling Syncer**:
-  - Implements `zapcore.WriteSyncer` for zero-overhead integration with `go.uber.org/zap`.
-  - Configured with `RotateAt: "00:00"` (UTC schedule), `MaxSize: 100` (MB), and `MaxAge: 30` (days).
-- **Structured Fields**:
-  - Every log entry contains structured contextual fields: `timestamp`, `level`, `component`, `node_id`, `caller`, and `message`.
-- **Zap Core Initialization**:
-  ```go
-  package logger
-
-  import (
-      "path/filepath"
-      "time"
-
-      "go.uber.org/zap"
-      "go.uber.org/zap/zapcore"
-      "github.com/DeRuina/timberjack" // timberlog rolling syncer
-  )
-
-  type Config struct {
-      LogDir     string        // Path to directory where logs are saved
-      MaxSizeMB  int           // Max file size in megabytes before rotation (default: 100MB)
-      MaxAgeDays int           // Max age in days to retain log files (default: 30d)
-      RotateUTC  string        // Rotation time in UTC (default: "00:00")
-      Level      zapcore.Level // Minimum log level
-  }
-
-  func New(cfg Config) (*zap.Logger, error) {
-      if cfg.MaxSizeMB <= 0 {
-          cfg.MaxSizeMB = 100
-      }
-      if cfg.MaxAgeDays <= 0 {
-          cfg.MaxAgeDays = 30
-      }
-      if cfg.RotateUTC == "" {
-          cfg.RotateUTC = "00:00"
-      }
-
-      logPath := filepath.Join(cfg.LogDir, "mariamesh.log")
-
-      rollingSyncer := &timberjack.Logger{
-          Filename:         logPath,
-          MaxSize:          cfg.MaxSizeMB,
-          MaxAge:           cfg.MaxAgeDays,
-          RotationInterval: 24 * time.Hour,
-          RotateAt:         []string{cfg.RotateUTC},
-          Compress:         true,
-      }
-
-      encoderConfig := zap.NewProductionEncoderConfig()
-      encoderConfig.TimeKey = "ts"
-      encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-      encoderConfig.EncodeDuration = zapcore.StringDurationEncoder
-
-      core := zapcore.NewCore(
-          zapcore.NewJSONEncoder(encoderConfig),
-          zapcore.AddSync(rollingSyncer),
-          cfg.Level,
-      )
-
-      return zap.New(core, zap.AddCaller()), nil
-  }
-  ```
-
 ---
 
-## Database Metadata Schema
+## Complete Database Metadata Schema
 
-The package controls and creates these internal tables in the MariaDB database:
+The package controls and creates these internal tables in MariaDB:
 
-### `replication_registered_tables`
-Registry of all tables participating in replication:
+### Intra-Mesh Core Replication Tables
+
 ```sql
+-- 1. Table Registry
 CREATE TABLE IF NOT EXISTS replication_registered_tables (
     table_name VARCHAR(128) PRIMARY KEY,
     id_column VARCHAR(64) NOT NULL DEFAULT 'id',
@@ -261,11 +308,8 @@ CREATE TABLE IF NOT EXISTS replication_registered_tables (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
-```
 
-### `replication_node`
-Tracks cluster nodes and administrative membership epochs:
-```sql
+-- 2. Cluster Nodes & Membership Epochs
 CREATE TABLE IF NOT EXISTS replication_node (
     node_id BINARY(16) NOT NULL,
     incarnation_id BINARY(16) NOT NULL,
@@ -278,11 +322,8 @@ CREATE TABLE IF NOT EXISTS replication_node (
     last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (node_id, incarnation_id)
 ) ENGINE=InnoDB;
-```
 
-### `replication_local_state`
-Single-row state maintaining the local node's transactional sequence counter and HLC:
-```sql
+-- 3. Local Sequence & HLC State
 CREATE TABLE IF NOT EXISTS replication_local_state (
     node_id BINARY(16) PRIMARY KEY,
     incarnation_id BINARY(16) NOT NULL,
@@ -291,11 +332,8 @@ CREATE TABLE IF NOT EXISTS replication_local_state (
     hlc_logical INT UNSIGNED NOT NULL DEFAULT 0,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
-```
 
-### `replication_log`
-Immutable changelog containing local and forwarded changes:
-```sql
+-- 4. Changelog Store
 CREATE TABLE IF NOT EXISTS replication_log (
     origin_node_id BINARY(16) NOT NULL,
     origin_incarnation_id BINARY(16) NOT NULL,
@@ -312,11 +350,8 @@ CREATE TABLE IF NOT EXISTS replication_log (
     KEY idx_repl_table_row (table_name, row_id),
     KEY idx_repl_received (received_at)
 ) ENGINE=InnoDB;
-```
 
-### `replication_field_version`
-Column-level LWW metadata supporting fine-grained conflict resolution:
-```sql
+-- 5. Per-Field Versioning for LWW
 CREATE TABLE IF NOT EXISTS replication_field_version (
     table_name VARCHAR(128) NOT NULL,
     row_id BINARY(16) NOT NULL,
@@ -327,11 +362,8 @@ CREATE TABLE IF NOT EXISTS replication_field_version (
     origin_seq BIGINT UNSIGNED NOT NULL,
     PRIMARY KEY (table_name, row_id, column_name)
 ) ENGINE=InnoDB;
-```
 
-### `replication_tombstone`
-Tracks deleted rows to prevent resurrection by offline nodes:
-```sql
+-- 6. Tombstones for Deletions
 CREATE TABLE IF NOT EXISTS replication_tombstone (
     table_name VARCHAR(128) NOT NULL,
     row_id BINARY(16) NOT NULL,
@@ -342,11 +374,8 @@ CREATE TABLE IF NOT EXISTS replication_tombstone (
     deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (table_name, row_id)
 ) ENGINE=InnoDB;
-```
 
-### `replication_progress`
-Replication vectors representing contiguous acknowledged sequences per origin:
-```sql
+-- 7. Contiguous Sequence Progress Vectors
 CREATE TABLE IF NOT EXISTS replication_progress (
     receiver_node_id BINARY(16) NOT NULL,
     receiver_incarnation_id BINARY(16) NOT NULL,
@@ -356,11 +385,8 @@ CREATE TABLE IF NOT EXISTS replication_progress (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (receiver_node_id, receiver_incarnation_id, origin_node_id, origin_incarnation_id)
 ) ENGINE=InnoDB;
-```
 
-### `replication_bootstrap` & `replication_bootstrap_vector`
-Seeding coordination and GC retention pins for new nodes:
-```sql
+-- 8. Bootstrap Seeding & GC Retention Pins
 CREATE TABLE IF NOT EXISTS replication_bootstrap (
     bootstrap_id BINARY(16) PRIMARY KEY,
     joining_node_id BINARY(16) NOT NULL,
@@ -380,6 +406,101 @@ CREATE TABLE IF NOT EXISTS replication_bootstrap_vector (
 ) ENGINE=InnoDB;
 ```
 
+### High/Low Air-Gap Replication Tables
+
+```sql
+-- 9. Low-side Persistent Event Journal
+CREATE TABLE IF NOT EXISTS replication_highlow_events (
+    stream_id VARCHAR(128) NOT NULL,
+    sequence BIGINT NOT NULL,
+    event_json LONGBLOB NOT NULL,
+    committed_at_ms BIGINT NOT NULL DEFAULT 0,
+    exported_at_ms BIGINT NULL DEFAULT NULL,
+    PRIMARY KEY (stream_id, sequence)
+) ENGINE=InnoDB;
+
+-- 10. Low-side Exported Outbox
+CREATE TABLE IF NOT EXISTS replication_highlow_outbox (
+    bundle_id VARCHAR(64) PRIMARY KEY,
+    stream_id VARCHAR(128) NOT NULL,
+    sequence_first BIGINT NOT NULL,
+    sequence_last BIGINT NOT NULL,
+    payload_filename VARCHAR(255) NOT NULL UNIQUE,
+    manifest_filename VARCHAR(255) NOT NULL UNIQUE,
+    created_at_ms BIGINT NOT NULL,
+    uploaded_at_ms BIGINT NULL DEFAULT NULL
+) ENGINE=InnoDB;
+
+-- 11. High-side Ingested Inbox
+CREATE TABLE IF NOT EXISTS replication_highlow_inbox (
+    bundle_id VARCHAR(64) PRIMARY KEY,
+    stream_id VARCHAR(128) NOT NULL,
+    sequence_first BIGINT NOT NULL,
+    sequence_last BIGINT NOT NULL,
+    received_at_ms BIGINT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    detail TEXT NULL
+) ENGINE=InnoDB;
+
+-- 12. High-side Stream Sequence Tracker
+CREATE TABLE IF NOT EXISTS replication_highlow_streams (
+    stream_id VARCHAR(128) PRIMARY KEY,
+    highest_seen_sequence BIGINT NOT NULL DEFAULT 0,
+    highest_contiguous_sequence BIGINT NOT NULL DEFAULT 0,
+    updated_at_ms BIGINT NOT NULL
+) ENGINE=InnoDB;
+
+-- 13. High-side Provenance & Column Override Registry
+CREATE TABLE IF NOT EXISTS replication_highlow_provenance (
+    table_name VARCHAR(128) NOT NULL,
+    primary_key_json VARCHAR(512) NOT NULL,
+    stream_id VARCHAR(128) NOT NULL,
+    low_first_applied_at_ms BIGINT NOT NULL,
+    low_last_applied_at_ms BIGINT NOT NULL,
+    last_high_override_at_ms BIGINT NULL DEFAULT NULL,
+    high_owned_fields_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (table_name, primary_key_json)
+) ENGINE=InnoDB;
+
+-- 14. Replay Jobs & Execution State (Low-only)
+CREATE TABLE IF NOT EXISTS replication_highlow_replay_jobs (
+    job_id VARCHAR(64) PRIMARY KEY,
+    state VARCHAR(32) NOT NULL,
+    scope VARCHAR(32) NOT NULL,
+    since_utc VARCHAR(64) NULL,
+    end_sequence BIGINT NOT NULL,
+    cursor_sequence BIGINT NOT NULL DEFAULT 0,
+    total_events BIGINT NOT NULL DEFAULT 0,
+    replayed_events BIGINT NOT NULL DEFAULT 0,
+    bundle_count BIGINT NOT NULL DEFAULT 0,
+    created_at_ms BIGINT NOT NULL,
+    started_at_ms BIGINT NULL,
+    completed_at_ms BIGINT NULL,
+    error TEXT NULL
+) ENGINE=InnoDB;
+
+-- 15. Replay Audit Logs (Low-only)
+CREATE TABLE IF NOT EXISTS replication_highlow_replay_logs (
+    job_id VARCHAR(64) NOT NULL,
+    ordinal BIGINT NOT NULL,
+    at_ms BIGINT NOT NULL,
+    level VARCHAR(16) NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+) ENGINE=InnoDB;
+
+-- 16. Exporter/Importer Worker Results
+CREATE TABLE IF NOT EXISTS replication_highlow_worker_results (
+    kind VARCHAR(32) PRIMARY KEY, -- 'export' or 'import'
+    state VARCHAR(32) NOT NULL,
+    bundle_id VARCHAR(64) NULL,
+    stream_id VARCHAR(128) NULL,
+    event_count BIGINT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    error TEXT NULL
+) ENGINE=InnoDB;
+```
+
 ---
 
 ## Trigger Strategy & CDC Execution
@@ -390,8 +511,8 @@ For each replicated table (e.g. `device`), `mariamesh` generates and manages thr
 2. `device_repl_update`: Performs NULL-safe comparisons (`IF NOT (OLD.col <=> NEW.col)`) and includes only modified columns in the JSON payload.
 3. `device_repl_delete`: Emits a tombstone event.
 
-### Transactional Sequence Increment
-Triggers atomically increment `replication_local_state.current_seq` inside the application's transaction:
+### Transactional Sequence & High/Low Journaling
+Triggers atomically increment `replication_local_state.current_seq` and record into both `replication_log` and `replication_highlow_events` (if Low role is active) inside the application's transaction:
 ```sql
 UPDATE replication_local_state 
 SET current_seq = current_seq + 1 
@@ -401,10 +522,9 @@ SELECT current_seq INTO @seq
 FROM replication_local_state 
 WHERE node_id = @local_node_id;
 ```
-This guarantees that application row modifications, sequence allocation, and changelog entries commit atomically.
 
 ### Avoiding Infinite Loops (`@replication_apply`)
-When `mariamesh` applies incoming remote changes, it sets a connection session variable on its dedicated connection:
+When `mariamesh` applies incoming remote changes (from either the intra-mesh QUIC sync or High/Low bundle ingestion), it sets a connection session variable on its dedicated connection:
 ```sql
 SET @replication_apply = 1;
 ```
@@ -443,20 +563,6 @@ sequenceDiagram
     Note over MDB: MariaDB continues running if mariamesh exits
 ```
 
-### Key Management Details
-- **FIFO Security**: Created with mode `0600` under a protected runtime directory. Open operations use non-blocking/timed writer routines to prevent deadlocks if MariaDB fails to start.
-- **MariaDB Configuration**: Configured with `file_key_management` plugin pointing to the FIFO path:
-  ```ini
-  [mariadb]
-  plugin_load_add = file_key_management
-  file_key_management_filename = /var/run/mariamesh/key.fifo
-  file_key_management_encryption_algorithm = AES_CTR
-  encrypt_binlog = ON
-  innodb_encrypt_tables = ON
-  innodb_encrypt_log = ON
-  ```
-- **Independent Daemonization**: Spawning via `exec.Command` with `SysProcAttr: &syscall.SysProcAttr{Setsid: true}` detaches the MariaDB process from the parent process group, ensuring MariaDB remains active even if `mariamesh` is stopped or upgraded.
-
 ---
 
 ## Startup Schema & Replication Validation Engine
@@ -467,7 +573,7 @@ When `mariamesh` initializes, it executes a strict read-only validation pass:
 flowchart TD
     Start([Package Startup]) --> FetchTables[Query replication_registered_tables]
     FetchTables --> LoopTables{For each registered table}
-    LoopTables -- Done --> StartReplication([Start QUIC & Sync Engine])
+    LoopTables -- Done --> StartReplication([Start Logging, QUIC Mesh & High/Low Workers])
     LoopTables -- Check Table --> CheckExists{Table exists in DB?}
     
     CheckExists -- No --> ErrMissingTable[Error: Table missing in DB]
@@ -491,17 +597,6 @@ flowchart TD
     ErrNameCol --> FailFast
     ErrTriggers --> FailFast
 ```
-
-### Validation Checklist
-1. **Table Existence**: Verified via `information_schema.tables`.
-2. **Primary Key Strictness**: Confirmed via `information_schema.table_constraints` that `PRIMARY KEY` is solely the `id` column.
-3. **No Secondary Unique Indexes**: Query `information_schema.statistics` for `NON_UNIQUE = 0 AND INDEX_NAME != 'PRIMARY'`. If any exist, fail startup.
-4. **Mandatory `name` Column**: Ensure column `name` exists and has `IS_NULLABLE = 'NO'`.
-5. **CDC Triggers**: Query `information_schema.triggers` to confirm presence and definition checksums of:
-   - `<table>_repl_insert`
-   - `<table>_repl_update`
-   - `<table>_repl_delete`
-6. **Column Compatibility**: Verify that all declared replicated columns exist with compatible data types.
 
 ---
 
@@ -546,28 +641,6 @@ flowchart LR
 
 ---
 
-## Wire Protocol & State Synchronization
-
-### Message Framing Types
-1. `HELLO`: Protocol version, `node_id`, `incarnation_id`, `schema_version`, and `membership_epoch`.
-2. `VECTOR`: Map of `{origin_node_id: max_contiguous_seq}`.
-3. `BATCH`: Ordered array of changelog entries with origin metadata, HLC, and JSON payload.
-4. `ACK`: Map of `{origin_node_id: acknowledged_seq}` sent after local transaction commit.
-5. `SEED_START` / `SEED_CHUNK` / `SEED_FINISH`: Consistent snapshot transfer messages.
-6. `GOSSIP`: SWIM failure detection and membership propagation.
-
-### Store-and-Forward Propagation
-Changes propagate across arbitrary multi-hop topologies:
-```text
-Node A ──────> Node B ──────> Node C
-```
-- Node B receives change `(origin: A, seq: 100)` and stores it verbatim in its `replication_log` without altering the origin metadata.
-- Node B forwards `(origin: A, seq: 100)` to Node C.
-- Deduplication is guaranteed by the composite primary key `(origin_node_id, origin_incarnation_id, origin_seq)`.
-- **Commit-Before-ACK**: A node sends an ACK for a batch only **after** the MariaDB transaction successfully commits.
-
----
-
 ## Conflict Resolution: Hybrid Logical Clocks & Column LWW
 
 ### Hybrid Logical Clock (HLC)
@@ -587,32 +660,6 @@ When applying an incoming change for column $C$ of row $R$:
 4. If incoming HLC loses:
    - Discard column update.
    - Still record the change event in `replication_log` for store-and-forward routing.
-
-### Tombstones for Deletes
-- Row deletions insert a record into `replication_tombstone` with the delete's HLC.
-- An incoming update with an HLC older than the tombstone is discarded, preventing resurrection of deleted rows.
-
----
-
-## Garbage Collection & Snapshot Seeding
-
-### Garbage Collection (GC)
-- Active nodes periodically compute the minimum acknowledged sequence across all active cluster members for each origin:
-  $$\text{GC\_Watermark}(\text{origin}) = \min_{n \in \text{ACTIVE}} \text{ACK}(n, \text{origin})$$
-- Rows in `replication_log` with $\text{origin\_seq} \le \text{GC\_Watermark}(\text{origin})$ are purged in bounded batches.
-- Nodes in `RETIRED` state are excluded from the calculation.
-- Nodes in `JOINING` state pin GC via their `replication_bootstrap_vector`.
-
-### Full Snapshot Seeding (New Node Join)
-1. The joining node connects to a donor node via a bidirectional QUIC stream.
-2. The donor starts a consistent InnoDB read transaction (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
-3. The donor records the current replication vector:
-   $$V_{\text{seed}} = \{A: 12000, B: 8800, C: 4400\}$$
-4. The donor inserts $V_{\text{seed}}$ into `replication_bootstrap_vector` as an active GC retention pin.
-5. The donor streams table schemas and row contents in chunks over QUIC.
-6. The joining node applies rows with `@replication_apply = 1`.
-7. Once snapshot streaming completes, normal delta replication catches up missing events ($> V_{\text{seed}}$).
-8. The joining node transitions from `JOINING` to `ACTIVE`.
 
 ---
 
@@ -637,6 +684,15 @@ mariamesh/
 │   │   └── transport/        # quic-go transport, framing & multiplexed streams
 │   ├── ddl/                  # Package DDL execution & schema migration engine
 │   ├── gc/                   # Distributed garbage collection engine
+│   ├── highlow/              # High/Low Air-Gap Cross-Domain Subsystem
+│   │   ├── apply/            # High sparse merge & column masking engine
+│   │   ├── bundle/           # Bundle construction, serialization & validation
+│   │   ├── control/          # Isolated mTLS REST control API
+│   │   ├── crypto/           # Zstd, XChaCha20Poly1305, RSA-OAEP & Ed25519 sealer/unsealer
+│   │   ├── provenance/       # High-owned fields & row origin tracking
+│   │   ├── replay/           # Low replay worker & job state engine
+│   │   ├── transport/        # Directory, HTTP(S), SFTP & S3 cross-domain adapters
+│   │   └── worker/           # Background exporter & importer loops
 │   ├── logger/               # Unified Zap + timberlog rolling file engine (00:00 UTC, 30d)
 │   ├── process/              # MariaDB process manager & FIFO key handshake
 │   ├── schema/               # Startup schema & trigger validation engine
@@ -664,14 +720,71 @@ import (
     "go.uber.org/zap/zapcore"
 )
 
+// TransportKind identifies cross-domain air-gap transport adapters.
+type TransportKind string
+
+const (
+    TransportDirectory TransportKind = "directory"
+    TransportHTTP      TransportKind = "http"
+    TransportHTTPS     TransportKind = "https"
+    TransportSFTP      TransportKind = "sftp"
+    TransportS3        TransportKind = "s3"
+)
+
+// HighLowTransportConfig configures the air-gap staging transport.
+type HighLowTransportConfig struct {
+    Kind        TransportKind
+    Endpoint    string // e.g. "dir:///var/spool/airgap" or "https://drop.example.com"
+    Username    string
+    Password    string
+    BearerToken string
+    S3Bucket    string
+    S3Region    string
+}
+
+// LowRoleConfig configures the Low-side exporter.
+type LowRoleConfig struct {
+    StreamID               string
+    UploadInterval         time.Duration
+    RecipientRSAKeyPEM     string // Public RSA key of High node
+    RecipientKeyID         string
+    SenderSigningKeyHex    string // Ed25519 private signing key
+    SenderKeyID            string
+}
+
+// HighRoleConfig configures the High-side importer.
+type HighRoleConfig struct {
+    AcceptedStreamIDs      []string
+    FetchInterval          time.Duration
+    RecipientPrivateKeyPEM string // Private RSA key of High node
+    SenderPublicKeys       map[string]string // Ed25519 public keys keyed by sender_key_id
+}
+
+// ControlAPIConfig configures the dedicated High/Low mTLS management API.
+type ControlAPIConfig struct {
+    ListenAddr      string
+    ServerCertPEM   string
+    ServerKeyPEM    string
+    ClientCACertPEM string
+}
+
+// HighLowConfig configures the complete High/Low cross-domain subsystem.
+type HighLowConfig struct {
+    Enabled    bool
+    Low        *LowRoleConfig
+    High       *HighRoleConfig
+    Transport  *HighLowTransportConfig
+    ControlAPI *ControlAPIConfig
+}
+
 // LogConfig configures the unified Zap + timberlog logger.
 type LogConfig struct {
     LogDir      string        // Directory where log files are stored
     MaxSizeMB   int           // Max file size in MB before rotation (default: 100MB)
     MaxAgeDays  int           // Log retention in days (default: 30d)
     RotateUTC   string        // Daily rotation schedule in UTC (default: "00:00")
-    Level       zapcore.Level // Minimum log level (DebugLevel, InfoLevel, etc.)
-    Development bool          // Also output console logs for local development
+    Level       zapcore.Level // Minimum log level
+    Development bool          // Enable console output alongside file logs
 }
 
 // ProcessConfig controls the MariaDB daemon lifecycle and key handshake.
@@ -690,6 +803,7 @@ type Config struct {
     DB            *sql.DB
     Process       ProcessConfig
     Logging       LogConfig
+    HighLow       HighLowConfig
     NodeID        uuid.UUID
     IncarnationID uuid.UUID
     Namespace     uuid.UUID
@@ -700,16 +814,16 @@ type Config struct {
     ForwardMode   ForwardMode
 }
 
-// Replicator manages the MariaDB process, schema validation, and replication mesh.
+// Replicator manages the MariaDB process, schema validation, mesh, and High/Low replication.
 type Replicator struct { /* ... */ }
 
 // New creates a new Replicator instance.
 func New(cfg Config) (*Replicator, error)
 
-// Start MariaDB (if needed), validates schema, and launches the replication mesh.
+// Start initializes MariaDB (if needed), validates schema, and launches mesh + High/Low workers.
 func (r *Replicator) Start(ctx context.Context) error
 
-// Close gracefully stops the replication mesh. MariaDB daemon continues running.
+// Close gracefully stops replication and workers. MariaDB daemon continues running.
 func (r *Replicator) Close() error
 
 // Logger returns the unified Zap logger instance used across all subsystems.
@@ -724,93 +838,11 @@ func (r *Replicator) AlterTable(ctx context.Context, table Table, ddlSQL string)
 // Validate verifies that registered tables, columns, PKs, and triggers match requirements.
 func (r *Replicator) Validate(ctx context.Context) error
 
-// Cluster membership and peer management.
-func (r *Replicator) AddPeer(ctx context.Context, addr string) error
-func (r *Replicator) RemovePeer(ctx context.Context, addr string) error
-func (r *Replicator) AddNode(ctx context.Context, nodeID uuid.UUID, name string) error
-func (r *Replicator) RetireNode(ctx context.Context, nodeID uuid.UUID) error
-```
+// TriggerReplay queues a historical event replay on a Low node.
+func (r *Replicator) TriggerReplay(ctx context.Context, scope string, sinceUTC string) error
 
-### Host Application Integration Example
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-    "github.com/google/uuid"
-    "go.uber.org/zap/zapcore"
-    "github.com/marcgauthier/mariamesh"
-)
-
-func main() {
-    ctx := context.Background()
-    namespace := uuid.MustParse("e0a5c43d-5f3e-4b92-8db7-658b09332e12")
-    nodeID := uuid.New()
-    incarnationID := uuid.New()
-
-    r, err := replication.New(replication.Config{
-        Process: replication.ProcessConfig{
-            AutoStart:     true,
-            BinaryPath:    "/usr/sbin/mariadbd",
-            ConfigFile:    "/etc/mysql/mariadb.cnf",
-            SocketPath:    "/var/run/mysqld/mysqld.sock",
-            FIFODir:       "/var/run/mariamesh",
-            DecryptionKey: []byte("my-secret-encryption-key-32bytes!"),
-        },
-        Logging: replication.LogConfig{
-            LogDir:      "/var/log/mariamesh",
-            MaxSizeMB:   100,             // Default 100MB per file
-            MaxAgeDays:  30,              // 30-day retention
-            RotateUTC:   "00:00",          // Rotate daily at 00:00 UTC
-            Level:       zapcore.InfoLevel,
-            Development: false,
-        },
-        NodeID:        nodeID,
-        IncarnationID: incarnationID,
-        Namespace:     namespace,
-        ListenAddr:    ":7443",
-        TLSConfig:     tlsConfig,
-    })
-    if err != nil {
-        log.Fatalf("Failed to initialize replicator: %v", err)
-    }
-
-    // Controls DDL creation and installs CDC triggers
-    err = r.CreateTable(ctx, replication.Table{
-        Name:       "device",
-        IDColumn:   "id",
-        NameColumn: "name",
-        Columns: []replication.Column{
-            {Name: "location", Type: "VARCHAR(255)"},
-            {Name: "ip_address", Type: "VARCHAR(45)"},
-        },
-    })
-    if err != nil {
-        log.Fatalf("DDL creation failed: %v", err)
-    }
-
-    // Start launches MariaDB process (if not running), validates schemas & triggers, and starts mesh
-    if err := r.Start(ctx); err != nil {
-        log.Fatalf("Replication start failed: %v", err)
-    }
-    defer r.Close()
-
-    // Application performs direct DML SQL queries against MariaDB
-    db := r.DB()
-    deviceID := replication.ID(namespace, "device", "Router-01")
-
-    _, err = db.ExecContext(ctx, `
-        INSERT INTO device (id, name, location, ip_address) 
-        VALUES (?, ?, ?, ?)
-    `, deviceID, "Router-01", "Ottawa", "192.168.1.1")
-    if err != nil {
-        log.Fatalf("Direct application insert failed: %v", err)
-    }
-
-    select {} // Run service
-}
+// HighLowProvenance queries row origin and High-owned fields on a High node.
+func (r *Replicator) HighLowProvenance(ctx context.Context, table string, pk map[string]any) (map[string]any, error)
 ```
 
 ---
@@ -845,17 +877,21 @@ func main() {
    - Implement version vector exchange and missing range calculations.
    - Implement bounded batch streaming with commit-before-ACK invariants.
    - Implement multi-hop store-and-forward mesh propagation.
-8. **Phase 8: Distributed Garbage Collection**
-   - Implement per-origin minimum ACK calculation across active cluster members.
-   - Implement bounded changelog pruning and tombstone expiration.
-9. **Phase 9: Consistent Snapshot Seeding**
-   - Implement InnoDB consistent snapshot streaming for joining nodes.
-   - Implement bootstrap retention pins preventing premature GC during snapshot transfer.
-   - Implement catch-up delta sync and transition from `JOINING` to `ACTIVE`.
-10. **Phase 10: Administrative Membership & Incarnation Management**
-    - Implement epoch-based cluster membership transitions.
-    - Implement permanent incarnation retirement safeguards.
+8. **Phase 8: High/Low Air-Gap Cryptography & Bundles**
+   - Port Galvanize bundle construction, validation, and SHA-256 `schema_hash` calculation.
+   - Implement Zstd compression, XChaCha20Poly1305 symmetric encryption, RSA-OAEP key wrapping, and Ed25519 manifest signing.
+   - Implement transport adapters: Directory (atomic rename), HTTP(S), SFTP, and S3.
+9. **Phase 9: High/Low Exporter, Importer, Provenance & Replay**
+   - Implement Low exporter worker polling `replication_highlow_events` and sealing bundles.
+   - Implement High importer worker verifying manifests, unsealing bundles, and recording inbox/stream sequences.
+   - Implement High sparse merge engine respecting `replication_highlow_provenance` and High-owned fields.
+   - Implement Low replay worker and dedicated mTLS REST control API.
+10. **Phase 10: Distributed Garbage Collection & Snapshot Seeding**
+    - Implement per-origin minimum ACK calculation across active cluster members.
+    - Implement bounded changelog pruning and tombstone expiration.
+    - Implement InnoDB consistent snapshot streaming for joining nodes with GC retention pins.
 11. **Phase 11: Production Hardening & Verification**
     - Multi-node partition and convergence testing.
+    - End-to-end High/Low air-gap ingestion and sparse merge tests.
     - Process restart resilience tests (verifying MariaDB continues running across `mariamesh` restarts).
-    - Fuzz testing for QUIC message framing and corrupted packet handling.
+    - Fuzz testing for QUIC message framing, corrupted packet handling, and bundle unsealing.
