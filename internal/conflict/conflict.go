@@ -10,8 +10,8 @@ import (
 
 // Version identifies the winning write of one field (or tombstone).
 type Version struct {
-	HLC      clock.HLC
-	OriginID string // origin node UUID string, deterministic tie-break
+	HLC       clock.HLC
+	OriginID  string // origin node UUID string, deterministic tie-break
 	OriginSeq uint64 // final tie-break for same-node same-tick writes
 }
 

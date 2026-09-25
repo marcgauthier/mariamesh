@@ -91,9 +91,11 @@ func ValidateSchema(ctx context.Context, db *sql.DB, tables []Table) error {
 	var stateRows int
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM `replication_local_state`").Scan(&stateRows); err != nil {
 		fail("replication_local_state unreadable: %v", err)
-	} else if stateRows != 1 {
-		fail("replication_local_state must contain exactly one row, found %d", stateRows)
+	} else if stateRows > 1 {
+		fail("replication_local_state must contain at most one row, found %d", stateRows)
 	}
+	// Zero rows means a fresh database; Start initializes the singleton row.
+	// Validate stays strictly read-only and never creates it.
 
 	for _, t := range tables {
 		if err := t.Validate(); err != nil {

@@ -39,15 +39,20 @@ func (h HLC) Compare(o HLC) int {
 }
 
 // After reports h > o. Equal reports h == o.
-func (h HLC) After(o HLC) bool  { return h.Compare(o) > 0 }
-func (h HLC) Equal(o HLC) bool  { return h.Compare(o) == 0 }
-func (h HLC) String() string    { return time.UnixMilli(int64(h.Physical)).UTC().Format(time.RFC3339Nano) }
-func (h HLC) IsZero() bool      { return h.Physical == 0 && h.Logical == 0 }
-func Max(a, b HLC) HLC          { if a.Compare(b) >= 0 { return a }; return b }
+func (h HLC) After(o HLC) bool { return h.Compare(o) > 0 }
+func (h HLC) Equal(o HLC) bool { return h.Compare(o) == 0 }
+func (h HLC) String() string   { return time.UnixMilli(int64(h.Physical)).UTC().Format(time.RFC3339Nano) }
+func (h HLC) IsZero() bool     { return h.Physical == 0 && h.Logical == 0 }
+func Max(a, b HLC) HLC {
+	if a.Compare(b) >= 0 {
+		return a
+	}
+	return b
+}
 
 // Clock is a concurrency-safe HLC generator.
 type Clock struct {
-	mu      sync.Mutex
+	mu       sync.Mutex
 	physical uint64
 	logical  uint64
 	now      func() uint64 // millis; override in tests

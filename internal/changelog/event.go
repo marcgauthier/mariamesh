@@ -28,7 +28,7 @@ func (o Operation) Valid() bool {
 // Origin identifies one event log: the node + incarnation that produced it.
 // An incarnation's sequence space is append-only starting at 1.
 type Origin struct {
-	NodeID       string `json:"node_id"`
+	NodeID        string `json:"node_id"`
 	IncarnationID string `json:"incarnation_id"`
 }
 
@@ -47,13 +47,13 @@ func ParseKey(key string) (Origin, error) {
 // Event is one replicated row change. The identity
 // (Origin, OriginSeq) is globally unique and the deduplication key.
 type Event struct {
-	Origin    Origin         `json:"origin"`
-	OriginSeq uint64         `json:"origin_seq"`
-	ChangeID  string         `json:"change_id"`
-	Table     string         `json:"table"`
-	RowID     string         `json:"row_id"`
-	Op        Operation      `json:"op"`
-	HLC       clock.HLC      `json:"hlc"`
+	Origin    Origin    `json:"origin"`
+	OriginSeq uint64    `json:"origin_seq"`
+	ChangeID  string    `json:"change_id"`
+	Table     string    `json:"table"`
+	RowID     string    `json:"row_id"`
+	Op        Operation `json:"op"`
+	HLC       clock.HLC `json:"hlc"`
 	// Payload maps column -> new value for INSERT/UPDATE. UPDATE carries
 	// only changed columns. Values are JSON-decoded scalars (nil allowed).
 	// DELETE carries a nil payload.

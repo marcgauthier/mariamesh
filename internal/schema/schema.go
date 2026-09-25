@@ -165,15 +165,15 @@ var MetadataTables = []string{
 
 // RequiredColumns maps each metadata table to the columns validation expects.
 var RequiredColumns = map[string][]string{
-	"replication_node":            {"node_id", "incarnation_id", "name", "status", "membership_epoch", "schema_version", "addr", "joined_at", "retired_at", "last_seen"},
-	"replication_local_state":     {"node_id", "incarnation_id", "current_seq", "hlc_physical", "hlc_logical"},
-	"replication_log":             {"origin_node_id", "origin_incarnation_id", "origin_seq", "change_id", "table_name", "row_id", "operation", "hlc_physical", "hlc_logical", "payload"},
-	"replication_field_version":   {"table_name", "row_id", "column_name", "hlc_physical", "hlc_logical", "origin_node_id", "origin_seq"},
-	"replication_tombstone":       {"table_name", "row_id", "hlc_physical", "hlc_logical", "origin_node_id", "origin_seq"},
-	"replication_progress":        {"receiver_node_id", "receiver_incarnation_id", "origin_node_id", "origin_incarnation_id", "contiguous_seq"},
-	"replication_bootstrap":       {"bootstrap_id", "joining_node_id", "joining_incarnation_id", "status", "schema_version", "started_at", "completed_at"},
+	"replication_node":             {"node_id", "incarnation_id", "name", "status", "membership_epoch", "schema_version", "addr", "joined_at", "retired_at", "last_seen"},
+	"replication_local_state":      {"node_id", "incarnation_id", "current_seq", "hlc_physical", "hlc_logical"},
+	"replication_log":              {"origin_node_id", "origin_incarnation_id", "origin_seq", "change_id", "table_name", "row_id", "operation", "hlc_physical", "hlc_logical", "payload"},
+	"replication_field_version":    {"table_name", "row_id", "column_name", "hlc_physical", "hlc_logical", "origin_node_id", "origin_seq"},
+	"replication_tombstone":        {"table_name", "row_id", "hlc_physical", "hlc_logical", "origin_node_id", "origin_seq"},
+	"replication_progress":         {"receiver_node_id", "receiver_incarnation_id", "origin_node_id", "origin_incarnation_id", "contiguous_seq"},
+	"replication_bootstrap":        {"bootstrap_id", "joining_node_id", "joining_incarnation_id", "status", "schema_version", "started_at", "completed_at"},
 	"replication_bootstrap_vector": {"bootstrap_id", "origin_node_id", "origin_incarnation_id", "seed_seq"},
-	"replication_meta":            {"meta_key", "meta_value"},
+	"replication_meta":             {"meta_key", "meta_value"},
 }
 
 // TriggerNames returns the three trigger names for a table.

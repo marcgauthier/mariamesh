@@ -58,6 +58,10 @@ type Config struct {
 	SchemaVersion uint64
 	// ListenAddr is the QUIC listen address, e.g. ":7443".
 	ListenAddr string
+	// AdvertiseAddr is the dialable address gossiped to peers for
+	// dial-back, e.g. "10.0.0.5:7443". Defaults to ListenAddr, which
+	// only works when peers share the same loopback view.
+	AdvertiseAddr string
 	// TLSConfig provides mTLS credentials. NextProtos is set to ALPN
 	// automatically when empty. Required.
 	TLSConfig *tls.Config
