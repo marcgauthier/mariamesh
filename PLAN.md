@@ -1,6 +1,6 @@
 # MARIAMESH: Decentralized Multi-Master Replication for MariaDB
 
-`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes. It utilizes Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
+`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes. It utilizes Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
 
 ---
 
@@ -20,7 +20,12 @@ flowchart TD
             CorrosionTrans["Corrosion P2P Transport (quic-go + SWIM Gossip)"]
             SyncEngine["State Sync & CRDT Apply Engine"]
             HLCClock["Hybrid Logical Clock (HLC)"]
+            Logger["Unified Logger (Zap + timberlog)"]
         end
+    end
+
+    subgraph LogStorage ["Rotated File Logging (00:00 UTC / 30d Retention)"]
+        LogFiles["/var/log/mariamesh/mariamesh-YYYY-MM-DD.log"]
     end
 
     subgraph MariaDBProc ["MariaDB Server Process (Independent Daemon)"]
@@ -48,6 +53,13 @@ flowchart TD
     SyncEngine <--> CorrosionTrans
     CorrosionTrans <--> PeerA
     CorrosionTrans <--> PeerB
+
+    ProcMgr -.-> Logger
+    DDLMgr -.-> Logger
+    ValEngine -.-> Logger
+    CorrosionTrans -.-> Logger
+    SyncEngine -.-> Logger
+    Logger --> LogFiles
 ```
 
 ---
@@ -104,7 +116,17 @@ Every table configured for replication must satisfy strict structural invariants
   6. Trigger logic and column lists match expected metadata checksums.
 - **Fail-Fast Error Handling**: If any table violates any rule (missing triggers, missing `name` column, unauthorized unique constraints, or schema drift), `mariamesh` returns `ErrValidation` and **refuses to start**, preventing silent replication failure or data corruption.
 
-### 5. Node-to-Node Communication: Rust Corrosion Architecture Ported to Go
+### 5. Unified Logging with Zap and timberlog (Daily 00:00 UTC Rotation & 30d Retention)
+- **Centralized Structured Logger**:
+  - Logging is built using Uber's **Zap** (`go.uber.org/zap`) coupled with **`timberlog`** (time-based rolling write syncer).
+  - All logs across every internal subsystem (Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
+- **File Rotation & Retention Rules**:
+  - **Storage Directory**: Configurable folder (e.g. `/var/log/mariamesh` or configured path).
+  - **Daily Rotation at 00:00 UTC (`0000 UTC`)**: Log files rotate exactly at midnight UTC daily.
+  - **Default File Size**: Standard maximum file size limit (default `100MB`) triggers size-based rotation if exceeded before midnight.
+  - **Retention Policy**: Retains logs for **30 days** (`MaxAge: 30`), automatically pruning expired log files.
+
+### 6. Node-to-Node Communication: Rust Corrosion Architecture Ported to Go
 - Instead of reinventing peer-to-peer transport and clustering, `mariamesh` ports the architecture of **Superfly's Corrosion** (`superfly/corrosion`) to Golang:
   - **QUIC Transport (`quic-go`)**: Mirroring Corrosion's Quinn-based asynchronous QUIC stack.
     - Single cached long-lived QUIC connection per peer with TLS 1.3 / mTLS and ALPN `mariamesh-repl/1`.
@@ -116,6 +138,111 @@ Every table configured for replication must satisfy strict structural invariants
     - Graceful listener shutdown: refuse new handshakes, drain active streams, flush, and close.
   - **SWIM-based Gossip Membership (Porting Rust `Foca` to Go)**:
     - Decentralized membership with indirect probing, suspicion mechanism, and incarnation numbers.
+
+---
+
+## Unified Logging Architecture: Zap & timberlog
+
+```mermaid
+flowchart TD
+    subgraph Subsystems ["mariamesh Subsystems"]
+        Proc["Process Manager"]
+        DDL["DDL & Schema Validator"]
+        Transport["Corrosion QUIC Transport"]
+        Gossip["SWIM Gossip Engine"]
+        Sync["Delta Sync & Apply Engine"]
+        GC["Garbage Collector"]
+        Seed["Snapshot Seeder"]
+    end
+
+    subgraph LogEngine ["Unified Logger Core"]
+        ZapCore["Zap Core Logger (Structured JSON / Console)"]
+        Timberlog["timberlog WriteSyncer"]
+    end
+
+    subgraph Storage ["Log Storage & Rotation"]
+        DailyFile["/var/log/mariamesh/mariamesh-2026-09-25.log"]
+        Rotator["Rotation Trigger (00:00 UTC or 100MB)"]
+        Retain["30-Day Retention Cleaner (Prune > 30d)"]
+    end
+
+    Proc --> ZapCore
+    DDL --> ZapCore
+    Transport --> ZapCore
+    Gossip --> ZapCore
+    Sync --> ZapCore
+    GC --> ZapCore
+    Seed --> ZapCore
+
+    ZapCore --> Timberlog
+    Timberlog --> DailyFile
+    Rotator --> DailyFile
+    Retain --> DailyFile
+```
+
+### Logging Configuration & Implementation Details
+- **`timberlog` Rolling Syncer**:
+  - Implements `zapcore.WriteSyncer` for zero-overhead integration with `go.uber.org/zap`.
+  - Configured with `RotateAt: "00:00"` (UTC schedule), `MaxSize: 100` (MB), and `MaxAge: 30` (days).
+- **Structured Fields**:
+  - Every log entry contains structured contextual fields: `timestamp`, `level`, `component`, `node_id`, `caller`, and `message`.
+- **Zap Core Initialization**:
+  ```go
+  package logger
+
+  import (
+      "path/filepath"
+      "time"
+
+      "go.uber.org/zap"
+      "go.uber.org/zap/zapcore"
+      "github.com/DeRuina/timberjack" // timberlog rolling syncer
+  )
+
+  type Config struct {
+      LogDir     string        // Path to directory where logs are saved
+      MaxSizeMB  int           // Max file size in megabytes before rotation (default: 100MB)
+      MaxAgeDays int           // Max age in days to retain log files (default: 30d)
+      RotateUTC  string        // Rotation time in UTC (default: "00:00")
+      Level      zapcore.Level // Minimum log level
+  }
+
+  func New(cfg Config) (*zap.Logger, error) {
+      if cfg.MaxSizeMB <= 0 {
+          cfg.MaxSizeMB = 100
+      }
+      if cfg.MaxAgeDays <= 0 {
+          cfg.MaxAgeDays = 30
+      }
+      if cfg.RotateUTC == "" {
+          cfg.RotateUTC = "00:00"
+      }
+
+      logPath := filepath.Join(cfg.LogDir, "mariamesh.log")
+
+      rollingSyncer := &timberjack.Logger{
+          Filename:         logPath,
+          MaxSize:          cfg.MaxSizeMB,
+          MaxAge:           cfg.MaxAgeDays,
+          RotationInterval: 24 * time.Hour,
+          RotateAt:         []string{cfg.RotateUTC},
+          Compress:         true,
+      }
+
+      encoderConfig := zap.NewProductionEncoderConfig()
+      encoderConfig.TimeKey = "ts"
+      encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+      encoderConfig.EncodeDuration = zapcore.StringDurationEncoder
+
+      core := zapcore.NewCore(
+          zapcore.NewJSONEncoder(encoderConfig),
+          zapcore.AddSync(rollingSyncer),
+          cfg.Level,
+      )
+
+      return zap.New(core, zap.AddCaller()), nil
+  }
+  ```
 
 ---
 
@@ -510,6 +637,7 @@ mariamesh/
 │   │   └── transport/        # quic-go transport, framing & multiplexed streams
 │   ├── ddl/                  # Package DDL execution & schema migration engine
 │   ├── gc/                   # Distributed garbage collection engine
+│   ├── logger/               # Unified Zap + timberlog rolling file engine (00:00 UTC, 30d)
 │   ├── process/              # MariaDB process manager & FIFO key handshake
 │   ├── schema/               # Startup schema & trigger validation engine
 │   ├── seed/                 # Snapshot seeding & bootstrap retention pins
@@ -532,7 +660,19 @@ import (
     "time"
 
     "github.com/google/uuid"
+    "go.uber.org/zap"
+    "go.uber.org/zap/zapcore"
 )
+
+// LogConfig configures the unified Zap + timberlog logger.
+type LogConfig struct {
+    LogDir      string        // Directory where log files are stored
+    MaxSizeMB   int           // Max file size in MB before rotation (default: 100MB)
+    MaxAgeDays  int           // Log retention in days (default: 30d)
+    RotateUTC   string        // Daily rotation schedule in UTC (default: "00:00")
+    Level       zapcore.Level // Minimum log level (DebugLevel, InfoLevel, etc.)
+    Development bool          // Also output console logs for local development
+}
 
 // ProcessConfig controls the MariaDB daemon lifecycle and key handshake.
 type ProcessConfig struct {
@@ -549,6 +689,7 @@ type ProcessConfig struct {
 type Config struct {
     DB            *sql.DB
     Process       ProcessConfig
+    Logging       LogConfig
     NodeID        uuid.UUID
     IncarnationID uuid.UUID
     Namespace     uuid.UUID
@@ -557,7 +698,6 @@ type Config struct {
     ListenAddr    string
     TLSConfig     *tls.Config
     ForwardMode   ForwardMode
-    Logger        Logger
 }
 
 // Replicator manages the MariaDB process, schema validation, and replication mesh.
@@ -571,6 +711,9 @@ func (r *Replicator) Start(ctx context.Context) error
 
 // Close gracefully stops the replication mesh. MariaDB daemon continues running.
 func (r *Replicator) Close() error
+
+// Logger returns the unified Zap logger instance used across all subsystems.
+func (r *Replicator) Logger() *zap.Logger
 
 // CreateTable controls DDL schema creation, installs triggers, and registers replication.
 func (r *Replicator) CreateTable(ctx context.Context, table Table) error
@@ -597,6 +740,7 @@ import (
     "context"
     "log"
     "github.com/google/uuid"
+    "go.uber.org/zap/zapcore"
     "github.com/marcgauthier/mariamesh"
 )
 
@@ -614,6 +758,14 @@ func main() {
             SocketPath:    "/var/run/mysqld/mysqld.sock",
             FIFODir:       "/var/run/mariamesh",
             DecryptionKey: []byte("my-secret-encryption-key-32bytes!"),
+        },
+        Logging: replication.LogConfig{
+            LogDir:      "/var/log/mariamesh",
+            MaxSizeMB:   100,             // Default 100MB per file
+            MaxAgeDays:  30,              // 30-day retention
+            RotateUTC:   "00:00",          // Rotate daily at 00:00 UTC
+            Level:       zapcore.InfoLevel,
+            Development: false,
         },
         NodeID:        nodeID,
         IncarnationID: incarnationID,
@@ -668,38 +820,42 @@ func main() {
 1. **Phase 1: Identity & Schema Contracts**
    - Implement UUIDv5 generation and validation (`identity.go`).
    - Implement `Table` registry, ensuring mandatory `name` column and rejection of secondary unique indexes.
-2. **Phase 2: MariaDB Process Manager & FIFO Key Provisioner**
+2. **Phase 2: Unified Zap + timberlog Logging Engine**
+   - Implement Zap core integration with `timberlog` rolling write syncer.
+   - Configure daily rotation at 00:00 UTC, default 100MB file size, and 30-day retention pruning.
+   - Route all package subsystem log emitters into the unified logger.
+3. **Phase 3: MariaDB Process Manager & FIFO Key Provisioner**
    - Implement MariaDB running detection (PID, UNIX socket, TCP probe).
    - Implement FIFO creation (`mkfifo 0600`) and background key writer goroutine.
    - Implement detached daemon execution (`Setsid: true`) and readiness polling.
-3. **Phase 3: Package DDL Engine & Startup Schema Validator**
+4. **Phase 4: Package DDL Engine & Startup Schema Validator**
    - Implement metadata schema creation (`replication_registered_tables`, `replication_log`, etc.).
    - Implement DDL table creation and trigger generator (`_repl_insert`, `_repl_update`, `_repl_delete`).
    - Implement startup validator querying `information_schema` to verify table presence, column definitions, lack of secondary unique indexes, and active trigger definitions.
-4. **Phase 4: Local CDC & Apply Engine**
+5. **Phase 5: Local CDC & Apply Engine**
    - Implement transactional local sequence counter (`replication_local_state.current_seq`).
    - Implement `@replication_apply = 1` bypass mechanism.
    - Implement HLC generation, column-level LWW conflict resolution, and tombstone recording.
-5. **Phase 5: Corrosion P2P Transport Layer in Go**
+6. **Phase 6: Corrosion P2P Transport Layer in Go**
    - Port `superfly/corrosion` QUIC transport to `quic-go`.
    - Implement long-lived cached connection pooling per peer with mTLS and ALPN `mariamesh-repl/1`.
    - Implement framing, message envelopes, and multiplexed stream routing (unidirectional broadcasts, bidirectional sync sessions).
    - Implement SWIM-based gossip failure detection and membership engine (porting Rust `Foca` to Go).
-6. **Phase 6: Delta State Synchronization**
+7. **Phase 7: Delta State Synchronization**
    - Implement version vector exchange and missing range calculations.
    - Implement bounded batch streaming with commit-before-ACK invariants.
    - Implement multi-hop store-and-forward mesh propagation.
-7. **Phase 7: Distributed Garbage Collection**
+8. **Phase 8: Distributed Garbage Collection**
    - Implement per-origin minimum ACK calculation across active cluster members.
    - Implement bounded changelog pruning and tombstone expiration.
-8. **Phase 8: Consistent Snapshot Seeding**
+9. **Phase 9: Consistent Snapshot Seeding**
    - Implement InnoDB consistent snapshot streaming for joining nodes.
    - Implement bootstrap retention pins preventing premature GC during snapshot transfer.
    - Implement catch-up delta sync and transition from `JOINING` to `ACTIVE`.
-9. **Phase 9: Administrative Membership & Incarnation Management**
-   - Implement epoch-based cluster membership transitions.
-   - Implement permanent incarnation retirement safeguards.
-10. **Phase 10: Production Hardening & Verification**
+10. **Phase 10: Administrative Membership & Incarnation Management**
+    - Implement epoch-based cluster membership transitions.
+    - Implement permanent incarnation retirement safeguards.
+11. **Phase 11: Production Hardening & Verification**
     - Multi-node partition and convergence testing.
     - Process restart resilience tests (verifying MariaDB continues running across `mariamesh` restarts).
     - Fuzz testing for QUIC message framing and corrupted packet handling.
