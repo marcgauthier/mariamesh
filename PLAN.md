@@ -1,6 +1,6 @@
 # MARIAMESH: Decentralized Multi-Master & Cross-Domain Replication for MariaDB
 
-`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes, as well as secure, unidirectional **High/Low Air-Gap Replication** across classified and unclassified security domains. It replaces `GALVANIZE`, utilizing Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
+`mariamesh` is an embeddable Go package providing masterless, multi-primary asynchronous database replication across a distributed mesh of MariaDB nodes, as well as secure, unidirectional **High/Low Air-Gap Replication** across classified and unclassified security domains. It replaces `GALVANIZE`, utilizing Conflict-free Replicated Data Type (CRDT) semantics with Hybrid Logical Clock (HLC) per-field Last-Write-Wins (LWW) conflict resolution, transactional trigger-based Change Data Capture (CDC), automated MariaDB configuration discovery and enforcement (data-at-rest encryption, FIFO key handshake, engine invariants), high-performance structured logging with **Zap** and **timberlog** (daily rotation at 00:00 UTC, 30-day retention), and a peer-to-peer networking transport ported directly from Superfly's **Corrosion** (`superfly/corrosion`) in Rust to Golang.
 
 ---
 
@@ -8,50 +8,63 @@
 
 ```mermaid
 flowchart TD
-    subgraph LowDomain ["Low-Security Domain (e.g. Field / Unclassified Node)"]
-        LowApp["Low Host App"]
-        LowDB[("MariaDB (Low)")]
-        LowTrig["CDC Triggers"]
-        LowJournal[("replication_highlow_events")]
-        LowExporter["mariamesh High/Low Exporter"]
-        LowSealer["Crypto Sealer (Zstd + XChaCha20 + RSA-OAEP + Ed25519)"]
-        LowReplay["Replay Worker Engine"]
-
-        LowApp --> LowDB
-        LowDB --> LowTrig
-        LowTrig --> LowJournal
-        LowJournal --> LowExporter
-        LowExporter --> LowSealer
-        LowReplay --> LowSealer
-    end
-
-    subgraph AirgapTransport ["Unidirectional Air-Gap / Cross-Domain Transport"]
-        Diode["Data Diode / File Staging / HTTP(S) / SFTP / S3"]
-        Artifacts["Sealed Bundle Pair:
-        1. Payload: *.zstd.galvh (Encrypted & Compressed)
-        2. Manifest: *.json.galv (Ed25519 Signed)"]
+    subgraph HostApp ["Host Application Process"]
+        AppLogic["Application Business Logic"]
+        SQLConn["Direct SQL (DML: INSERT / UPDATE / DELETE / SELECT)"]
+        MM["mariamesh Package (Go)"]
         
-        LowSealer --> Diode
-        Diode --> Artifacts
+        subgraph MMPkg ["mariamesh Engine"]
+            ConfMgr["MariaDB Config Discovery & Enforcement Engine"]
+            ProcMgr["MariaDB Process Manager & FIFO Key Provisioner"]
+            DDLMgr["Package DDL & Schema Migration Engine"]
+            ValEngine["Startup Schema & Trigger Validator"]
+            CorrosionTrans["Corrosion P2P Transport (quic-go + SWIM Gossip)"]
+            SyncEngine["State Sync & CRDT Apply Engine"]
+            HLCClock["Hybrid Logical Clock (HLC)"]
+            Logger["Unified Logger (Zap + timberlog)"]
+        end
     end
 
-    subgraph HighDomain ["High-Security Domain (e.g. Central / Classified Enclave)"]
-        Artifacts --> HighReceiver
-        HighReceiver["mariamesh High/Low Receiver"]
-        HighVerifier["Verifier & Decryptor (Ed25519 + RSA-OAEP + Zstd)"]
-        HighInbox[("replication_highlow_inbox & streams")]
-        HighApply["Sparse Merge & Provenance Engine"]
-        HighProv[("replication_highlow_provenance")]
-        HighDB[("MariaDB (High)")]
-        HighMesh["mariamesh Intra-Cluster Mesh (QUIC)"]
-
-        HighReceiver --> HighVerifier
-        HighVerifier --> HighInbox
-        HighInbox --> HighApply
-        HighProv <--> HighApply
-        HighApply --> HighDB
-        HighDB --> HighMesh
+    subgraph ConfigStorage ["Host Filesystem & OS"]
+        MdbCnf["MariaDB Config File (my.cnf / mariadb.cnf)"]
+        FIFOPipe["Decryption Key Named Pipe (FIFO)"]
+        LogFiles["/var/log/mariamesh/mariamesh-YYYY-MM-DD.log"]
     end
+
+    subgraph MariaDBProc ["MariaDB Server Process (Independent Daemon)"]
+        InnoDB["InnoDB Encrypted Tablespaces"]
+        AppTables["Replicated Tables (id = UUIDv5, name)"]
+        Triggers["CDC Triggers (_repl_insert, _repl_update, _repl_delete)"]
+        MetaTables["Replication Metadata & Changelog Tables"]
+    end
+
+    subgraph Mesh ["Peer-to-Peer Mesh Network"]
+        PeerA["Peer Node A (QUIC / mTLS)"]
+        PeerB["Peer Node B (QUIC / mTLS)"]
+    end
+
+    ConfMgr -- "1. Identify & Enforce Encryption Settings (Edit File)" --> MdbCnf
+    ProcMgr -- "2. Create FIFO & Start Process (Setsid)" --> FIFOPipe
+    MdbCnf -. "Read Enforced Config" .-> MariaDBProc
+    FIFOPipe -- "Decryption Key" --> MariaDBProc
+    DDLMgr -- "Execute DDL & Install Triggers" --> MariaDBProc
+    ValEngine -- "Validate Tables, Triggers & PK/Constraints" --> MariaDBProc
+    AppLogic -- "Normal Application Queries" --> SQLConn
+    SQLConn --> AppTables
+    AppTables -- "Fire CDC Triggers" --> Triggers
+    Triggers -- "Atomic Changelog Write" --> MetaTables
+    SyncEngine -- "Read & Apply Changes (@replication_apply=1)" --> MetaTables
+    SyncEngine <--> CorrosionTrans
+    CorrosionTrans <--> PeerA
+    CorrosionTrans <--> PeerB
+
+    ConfMgr -.-> Logger
+    ProcMgr -.-> Logger
+    DDLMgr -.-> Logger
+    ValEngine -.-> Logger
+    CorrosionTrans -.-> Logger
+    SyncEngine -.-> Logger
+    Logger --> LogFiles
 ```
 
 ---
@@ -82,16 +95,19 @@ Every table configured for replication must satisfy strict structural invariants
     $$\text{id} = \text{UUIDv5}(\text{NamespaceUUID}, \text{lower}(\text{tablename}) + \text{":"} + \text{lower}(\text{name}))$$
   - Once inserted, the `id` is **strictly immutable**. Subsequent updates to the `name` column (e.g. renaming an entity) do not regenerate or alter the `id`.
 
-### 3. MariaDB Process Management & FIFO Encryption Key Handshake
-- `mariamesh` controls when MariaDB starts.
-- **Startup Detection**: On startup, `mariamesh` checks if MariaDB is already running (via PID check, UNIX socket probe, or TCP health check).
-- **FIFO Key Decryption Flow**:
-  - If MariaDB is **not running**:
-    1. `mariamesh` creates a secure POSIX named pipe (FIFO file, `mkfifo` with permissions `0600`) at a designated path.
-    2. Spawns a background goroutine that writes the MariaDB data-at-rest decryption key into the FIFO pipe (for MariaDB's `file_key_management` plugin).
+### 3. MariaDB Configuration Discovery, Auto-Enforcement & Process Management
+- **Configuration File Auto-Discovery**:
+  - At startup, `mariamesh` locates the active MariaDB configuration file (`my.cnf`, `/etc/mysql/mariadb.cnf`, drop-in directories, or custom specified path).
+- **Automated Configuration Enforcement**:
+  - `mariamesh` inspects the configuration file to confirm all mandatory settings (data-at-rest encryption, FIFO key management plugin, InnoDB settings, character encoding, and replication invariants) are properly configured.
+  - If any required directive is missing, invalid, or incompatible, `mariamesh` **automatically edits and updates the configuration file** (creating a backup before writing) to enforce the required settings.
+- **MariaDB Process Management & FIFO Key Decryption**:
+  - `mariamesh` controls when MariaDB starts. If MariaDB is not running:
+    1. Creates a secure POSIX named pipe (FIFO file, `mkfifo` with mode `0600`) at a designated path.
+    2. Spawns a background goroutine to write the data-at-rest decryption key into the FIFO pipe for MariaDB's `file_key_management` plugin.
     3. Launches the MariaDB process (`mariadbd` / `mysqld`) as a detached, independent OS process (`Setsid: true` / independent process group).
-    4. MariaDB consumes the encryption key from the FIFO on boot, unlocks encrypted tablespaces, and finishes startup.
-    5. **Process Persistence**: Because MariaDB is launched as a detached normal OS process, **it continues running independently even if `mariamesh` or the host application goes down or restarts**.
+    4. MariaDB consumes the key, unlocks tablespaces, and finishes startup.
+    5. **Process Persistence**: MariaDB continues running as a normal independent daemon even if `mariamesh` stops or restarts.
     6. `mariamesh` polls the database connection until MariaDB is fully ready.
 
 ### 4. Startup Schema & Replication Validation Engine
@@ -111,7 +127,7 @@ Every table configured for replication must satisfy strict structural invariants
 ### 5. Unified Logging with Zap and timberlog (Daily 00:00 UTC Rotation & 30d Retention)
 - **Centralized Structured Logger**:
   - Logging is built using Uber's **Zap** (`go.uber.org/zap`) coupled with **`timberlog`** (time-based rolling write syncer).
-  - All logs across every internal subsystem (Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, High/Low Workers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
+  - All logs across every internal subsystem (Config Enforcement, Process Manager, DDL Migrations, Schema Validator, Corrosion QUIC Transport, SWIM Gossip, State Sync, CDC Triggers, High/Low Workers, GC, and Seed Snapshots) are routed exclusively to this unified logger.
 - **File Rotation & Retention Rules**:
   - **Storage Directory**: Configurable folder (e.g. `/var/log/mariamesh` or configured path).
   - **Daily Rotation at 00:00 UTC (`0000 UTC`)**: Log files rotate exactly at midnight UTC daily.
@@ -147,6 +163,124 @@ Every table configured for replication must satisfy strict structural invariants
   - High or administrators can trigger replay jobs (`ReplayScope::All` or `ReplayScope::Since(UTC)`) without disrupting scheduled export watermarks.
 - **Isolated mTLS Control API**:
   - High and Low expose a dedicated mTLS REST API for status reporting, replay orchestration, and provenance inspection.
+
+---
+
+## MariaDB Configuration Discovery & Auto-Enforcement
+
+```mermaid
+flowchart TD
+    Start([Package Startup]) --> LocateConfig[Locate Configuration File]
+    
+    subgraph DiscoveryChain ["1. Configuration Discovery Chain"]
+        LocateConfig --> CheckExplicit{ProcessConfig.ConfigFile specified?}
+        CheckExplicit -- Yes --> UseExplicit[Use Specified Config File]
+        CheckExplicit -- No --> ProbeKnownPaths{Check Known Paths:\n/etc/mysql/mariadb.cnf\n/etc/mysql/my.cnf\n/etc/my.cnf\n/etc/mariadb.cnf}
+        ProbeKnownPaths -- Found --> UseKnown[Use Discovered Path]
+        ProbeKnownPaths -- Not Found --> BinaryIntrospect[Run 'mariadbd --help --verbose'\nParse Default Options Files]
+        BinaryIntrospect --> UseIntrospect[Use Introspected Path]
+    end
+
+    UseExplicit --> ReadINI
+    UseKnown --> ReadINI
+    UseIntrospect --> ReadINI
+
+    subgraph InspectionEnforcement ["2. Inspection & Auto-Enforcement"]
+        ReadINI[Read & Parse INI Configuration] --> CheckSettings{Are all required settings\npresent and valid?}
+        
+        CheckSettings -- Yes --> Verified[Config Verified OK]
+        CheckSettings -- No --> BackupConfig[Create Timestamped Backup\n*.cnf.bak.YYYYMMDDHHMMSS]
+        BackupConfig --> EditINI[Update/Insert Required Directives under [mariadb]/[mysqld]]
+        EditINI --> WriteAtomic[Atomic Temp File Write & Rename (chmod 0644)]
+        WriteAtomic --> Reverify[Re-parse and Verify INI]
+        Reverify --> Verified
+    end
+
+    Verified --> ProcStart[Proceed to MariaDB Process Startup & FIFO Key Handshake]
+```
+
+### 1. Discovery Precedence Chain
+`mariamesh` searches for the MariaDB configuration file in the following order:
+1. `ProcessConfig.ConfigFile` (explicitly configured path).
+2. Standard Linux/Unix system locations:
+   - `/etc/mysql/mariadb.cnf`
+   - `/etc/mysql/my.cnf`
+   - `/etc/my.cnf`
+   - `/etc/mariadb.cnf`
+   - `/usr/local/etc/my.cnf`
+   - `~/.my.cnf`
+3. Include directories (if `!includedir /etc/mysql/mariadb.conf.d/` or similar is active, `mariamesh` manages a dedicated drop-in file `99-mariamesh.cnf`).
+4. MariaDB binary introspection: Executes `<BinaryPath> --help --verbose` and parses the `Default options are read from the following files in the given order:` section.
+
+### 2. Mandatory Settings Enforced by `mariamesh`
+
+`mariamesh` inspects the active configuration and automatically enforces the following settings in the `[mariadb]`, `[mysqld]`, or `[server]` sections:
+
+```ini
+[mariadb]
+# --- 1. Data-at-Rest Encryption (Mandatory) ---
+plugin_load_add = file_key_management
+file_key_management_filename = /var/run/mariamesh/key.fifo
+file_key_management_encryption_algorithm = AES_CTR
+innodb_encrypt_tables = ON
+innodb_encrypt_log = ON
+innodb_encryption_threads = 4
+innodb_encryption_rotate_key_age = 1
+encrypt_binlog = ON
+encrypt_tmp_disk_tables = ON
+encrypt_tmp_files = ON
+
+# --- 2. Engine Invariants & Consistency ---
+default_storage_engine = InnoDB
+character_set_server = utf8mb4
+collation_server = utf8mb4_unicode_520_ci
+transaction_isolation = READ-COMMITTED
+
+# --- 3. Replication & Performance Invariants ---
+binlog_format = ROW
+innodb_autoinc_lock_mode = 2
+max_allowed_packet = 64M
+```
+
+### 3. Safe Configuration File Editing Mechanics
+- **Backup Before Modification**: Before any change is made to an existing configuration file, `mariamesh` creates a backup copy:
+  $$\text{target.cnf} \longrightarrow \text{target.cnf.bak.}\langle\text{timestamp}\rangle$$
+- **Preserve Existing Directives & Comments**: The parser updates existing keys or appends missing keys while preserving all comments and unrelated user configurations.
+- **Atomic File Writing**: Writes the updated configuration to a temporary file in the same directory (`.target.cnf.tmp`), sets permissions (`0644`), and performs an atomic POSIX `rename` over the original file.
+- **Drop-In Preference**: If a drop-in configuration directory exists (e.g. `/etc/mysql/mariadb.conf.d/`), `mariamesh` writes its directives directly to `99-mariamesh.cnf`, ensuring clean separation from system package-managed files.
+
+---
+
+## MariaDB Process Management & Data-at-Rest Encryption
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as mariamesh Go Package
+    participant Conf as MariaDB Config File (my.cnf)
+    participant FIFO as POSIX Named Pipe (FIFO)
+    participant MDB as MariaDB Server Process (mariadbd)
+
+    Host->>Conf: Locate configuration file & verify required settings
+    opt Missing or invalid encryption/engine settings
+        Host->>Conf: Create backup & edit configuration file (Enforce encryption/FIFO)
+    end
+    Host->>Host: Check if MariaDB is running (Socket/PID/TCP)
+    alt MariaDB is already running
+        Host->>Host: Connect directly via database/sql
+    else MariaDB is not running
+        Host->>FIFO: Create FIFO (mkfifo 0600)
+        Host->>FIFO: Spawn background goroutine to write decryption key
+        Host->>MDB: Start mariadbd process (Setsid: true, independent process group)
+        MDB->>Conf: Read enforced configuration (file_key_management)
+        MDB->>FIFO: Read decryption key from FIFO named pipe
+        FIFO-->>Host: Goroutine completes write & closes pipe
+        MDB->>MDB: Unlock encrypted tablespaces & finish boot
+        Host->>Host: Poll MariaDB readiness probe (ping)
+        Host->>MDB: Establish *sql.DB connection pool
+    end
+    Note over MDB: MariaDB continues running if mariamesh exits
+```
 
 ---
 
@@ -226,25 +360,6 @@ When a Low change event is applied on High:
 3. **Tracking High Overrides**:
    - When an application executes a direct `UPDATE` on High for a row with `low_origin = true`, the database triggers update `replication_highlow_provenance`, appending the modified column names to `high_owned_fields_json` and updating `last_high_override_at_ms`.
 
-### 3. Transport Adapters
-`mariamesh` provides modular, robust transport adapters for cross-domain transfer:
-
-| Transport Kind | Usage / Air-Gap Compatibility | Key Mechanics |
-| :--- | :--- | :--- |
-| **Directory / Filesystem** | Local shared storage, USB/optical media drops, unidirectional data diodes | Writes to `.partial` temp file first, then executes atomic filesystem rename. |
-| **HTTP / HTTPS** | Networked cross-domain proxies or REST upload servers | HTTP `PUT` / `POST` with Bearer token or mTLS authentication. |
-| **SFTP / FTPS / FTP** | Legacy secure file transfer gateways | SSH key / password authenticated remote file staging. |
-| **S3 / Object Store** | Cloud or on-prem S3-compatible buckets (AWS, MinIO) | Multipart / single PUT with MD5 checksum verification. |
-
-### 4. Dedicated mTLS Control API
-Low and High nodes run an isolated, lightweight HTTP server protected by mutual TLS (client and server certificates validated against configured CAs):
-
-- `GET /v1/highlow/status`: Returns current worker state (`running`, `idle`), pending unexported event count, latest export result, latest import result, and active replay job summary.
-- `POST /v1/highlow/replay`: (Low-only) Enqueues an asynchronous historical replay job.
-  - Body: `{"scope": "all"}` or `{"scope": "since", "since_utc": "2026-09-20T00:00:00Z"}`.
-- `GET /v1/highlow/replay/status`: (Low-only) Returns the current active replay job and the latest 200 audit log entries.
-- `POST /v1/highlow/provenance`: (High-only) Accepts a list of `{table, primary_key}` pairs and returns their origin status (`low_origin: true/false`), stream ID, and `high_owned_fields`.
-
 ---
 
 ## Unified Logging Architecture: Zap & timberlog
@@ -252,6 +367,7 @@ Low and High nodes run an isolated, lightweight HTTP server protected by mutual 
 ```mermaid
 flowchart TD
     subgraph Subsystems ["mariamesh Subsystems"]
+        Conf["Config Discovery & Enforcer"]
         Proc["Process Manager"]
         DDL["DDL & Schema Validator"]
         Transport["Corrosion QUIC Transport"]
@@ -274,6 +390,7 @@ flowchart TD
         Retain["30-Day Retention Cleaner (Prune > 30d)"]
     end
 
+    Conf --> ZapCore
     Proc --> ZapCore
     DDL --> ZapCore
     Transport --> ZapCore
@@ -293,10 +410,6 @@ flowchart TD
 ---
 
 ## Complete Database Metadata Schema
-
-The package controls and creates these internal tables in MariaDB:
-
-### Intra-Mesh Core Replication Tables
 
 ```sql
 -- 1. Table Registry
@@ -404,11 +517,7 @@ CREATE TABLE IF NOT EXISTS replication_bootstrap_vector (
     seed_seq BIGINT UNSIGNED NOT NULL,
     PRIMARY KEY (bootstrap_id, origin_node_id, origin_incarnation_id)
 ) ENGINE=InnoDB;
-```
 
-### High/Low Air-Gap Replication Tables
-
-```sql
 -- 9. Low-side Persistent Event Journal
 CREATE TABLE IF NOT EXISTS replication_highlow_events (
     stream_id VARCHAR(128) NOT NULL,
@@ -503,166 +612,6 @@ CREATE TABLE IF NOT EXISTS replication_highlow_worker_results (
 
 ---
 
-## Trigger Strategy & CDC Execution
-
-### Trigger-Based Change Interception
-For each replicated table (e.g. `device`), `mariamesh` generates and manages three triggers:
-1. `device_repl_insert`: Captures all initial column values.
-2. `device_repl_update`: Performs NULL-safe comparisons (`IF NOT (OLD.col <=> NEW.col)`) and includes only modified columns in the JSON payload.
-3. `device_repl_delete`: Emits a tombstone event.
-
-### Transactional Sequence & High/Low Journaling
-Triggers atomically increment `replication_local_state.current_seq` and record into both `replication_log` and `replication_highlow_events` (if Low role is active) inside the application's transaction:
-```sql
-UPDATE replication_local_state 
-SET current_seq = current_seq + 1 
-WHERE node_id = @local_node_id;
-
-SELECT current_seq INTO @seq 
-FROM replication_local_state 
-WHERE node_id = @local_node_id;
-```
-
-### Avoiding Infinite Loops (`@replication_apply`)
-When `mariamesh` applies incoming remote changes (from either the intra-mesh QUIC sync or High/Low bundle ingestion), it sets a connection session variable on its dedicated connection:
-```sql
-SET @replication_apply = 1;
-```
-All generated triggers begin with:
-```sql
-IF @replication_apply IS NOT NULL AND @replication_apply = 1 THEN
-    -- In apply mode: Do not generate local replication events
-    LEAVE trigger_block;
-END IF;
-```
-
----
-
-## MariaDB Process Management & Data-at-Rest Encryption
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Host as mariamesh Go Package
-    participant FIFO as POSIX Named Pipe (FIFO)
-    participant MDB as MariaDB Server Process (mariadbd)
-
-    Host->>Host: Check if MariaDB is running (Socket/PID/TCP)
-    alt MariaDB is already running
-        Host->>Host: Connect directly via database/sql
-    else MariaDB is not running
-        Host->>FIFO: Create FIFO (mkfifo 0600)
-        Host->>FIFO: Spawn background goroutine to write decryption key
-        Host->>MDB: Start mariadbd process (Setsid: true, independent process group)
-        MDB->>FIFO: file_key_management plugin reads key from FIFO
-        FIFO-->>Host: Goroutine completes write & closes pipe
-        MDB->>MDB: Unlock encrypted tablespaces & finish boot
-        Host->>Host: Poll MariaDB readiness probe (ping)
-        Host->>MDB: Establish *sql.DB connection pool
-    end
-    Note over MDB: MariaDB continues running if mariamesh exits
-```
-
----
-
-## Startup Schema & Replication Validation Engine
-
-When `mariamesh` initializes, it executes a strict read-only validation pass:
-
-```mermaid
-flowchart TD
-    Start([Package Startup]) --> FetchTables[Query replication_registered_tables]
-    FetchTables --> LoopTables{For each registered table}
-    LoopTables -- Done --> StartReplication([Start Logging, QUIC Mesh & High/Low Workers])
-    LoopTables -- Check Table --> CheckExists{Table exists in DB?}
-    
-    CheckExists -- No --> ErrMissingTable[Error: Table missing in DB]
-    CheckExists -- Yes --> CheckPK{PK is strictly 'id'?}
-    
-    CheckPK -- No --> ErrInvalidPK[Error: Primary key must be 'id']
-    CheckPK -- Yes --> CheckUnique{Any secondary UNIQUE index?}
-    
-    CheckUnique -- Yes --> ErrUniqueIndex[Error: Secondary UNIQUE indexes forbidden]
-    CheckUnique -- No --> CheckNameCol{Mandatory 'name' column exists?}
-    
-    CheckNameCol -- No --> ErrNameCol[Error: Mandatory 'name' column missing]
-    CheckNameCol -- Yes --> CheckTriggers{Triggers active & valid?}
-    
-    CheckTriggers -- No --> ErrTriggers[Error: Missing or invalid CDC triggers]
-    CheckTriggers -- Yes --> LoopTables
-
-    ErrMissingTable --> FailFast([Abort Startup: ErrValidation])
-    ErrInvalidPK --> FailFast
-    ErrUniqueIndex --> FailFast
-    ErrNameCol --> FailFast
-    ErrTriggers --> FailFast
-```
-
----
-
-## Node-to-Node Communication: Porting Corrosion to Go
-
-`mariamesh` implements the distributed transport architecture of `superfly/corrosion`:
-
-```mermaid
-flowchart LR
-    subgraph NodeA ["Node A (mariamesh)"]
-        TransportA["Corrosion Transport Manager (quic-go)"]
-        FocaA["SWIM / Foca Gossip Engine"]
-        SyncEngineA["State Sync Engine"]
-    end
-
-    subgraph NodeB ["Node B (mariamesh)"]
-        TransportB["Corrosion Transport Manager (quic-go)"]
-        FocaB["SWIM / Foca Gossip Engine"]
-        SyncEngineB["State Sync Engine"]
-    end
-
-    TransportA <--"Unidirectional Streams (Change Broadcasts)"--> TransportB
-    TransportA <--"Bidirectional Streams (Delta Sync & Snapshots)"--> TransportB
-    FocaA <--"QUIC Datagrams (SWIM Pings & Membership Gossip)"--> FocaB
-```
-
-### Transport Layer Specifications
-- **Single Cached QUIC Connection Per Peer**: Multiplexes all application traffic over one connection per peer address, automatically handling reconnects with exponential backoff and single-flight retry.
-- **TLS 1.3 / mTLS**: Strict mutual certificate authentication binding peer certificates to `node_id`. ALPN is set to `mariamesh-repl/1`.
-- **Multiplexed Channels**:
-  1. **Unidirectional Streams (`stream_uni`)**: Fire-and-forget push broadcasts for newly committed local change events.
-  2. **Bidirectional Streams (`stream_bidi`)**: Request-response delta synchronization sessions (version vector exchange, missing event batch streaming, and ACK pipelines) and full snapshot streaming.
-  3. **QUIC Datagrams (`datagram`)**: Unreliable low-latency SWIM membership pings, ACKs, and gossip packets.
-- **Framing & Envelopes**: Length-delimited versioned envelopes with namespace verification:
-  ```text
-  ┌──────────────────┬────────────────────┬──────────────────────────────────────┐
-  │ Length (4 Bytes) │ Magic/Version (2B) │ Payload (JSON/Binary Envelope)       │
-  └──────────────────┴────────────────────┴──────────────────────────────────────┘
-  ```
-- **Live RTT Sampling**: Periodically measures QUIC path round-trip times to inform routing, gossip timeouts, and peer selection.
-- **Graceful Listener Lifecycle**: Rejects new handshakes, drains active streams, flushes ACK buffers, and shuts down cleanly.
-
----
-
-## Conflict Resolution: Hybrid Logical Clocks & Column LWW
-
-### Hybrid Logical Clock (HLC)
-Every change event is stamped with an HLC tuple:
-$$\text{HLC} = (\text{physical\_time\_ms}, \text{logical\_counter}, \text{origin\_node\_id})$$
-
-### Column-Level Last-Write-Wins (LWW)
-When applying an incoming change for column $C$ of row $R$:
-1. Read existing $(\text{hlc\_physical}, \text{hlc\_logical}, \text{origin\_node\_id})$ from `replication_field_version`.
-2. Compare incoming HLC against existing HLC:
-   - Higher physical timestamp wins.
-   - If physical timestamps are equal, higher logical counter wins.
-   - If logical counters are equal, lexicographical comparison of `origin_node_id` breaks ties deterministically.
-3. If incoming HLC wins:
-   - Apply column update to application table.
-   - Update `replication_field_version` with new HLC and origin sequence.
-4. If incoming HLC loses:
-   - Discard column update.
-   - Still record the change event in `replication_log` for store-and-forward routing.
-
----
-
 ## Internal Package Architecture
 
 ```text
@@ -694,7 +643,11 @@ mariamesh/
 │   │   ├── transport/        # Directory, HTTP(S), SFTP & S3 cross-domain adapters
 │   │   └── worker/           # Background exporter & importer loops
 │   ├── logger/               # Unified Zap + timberlog rolling file engine (00:00 UTC, 30d)
-│   ├── process/              # MariaDB process manager & FIFO key handshake
+│   ├── process/              # MariaDB Process Manager, Config Enforcer & FIFO key handshake
+│   │   ├── config_discovery.go # Locates my.cnf / mariadb.cnf / drop-in directories
+│   │   ├── config_enforce.go   # Parses INI, updates required settings & writes backup
+│   │   ├── daemon.go           # Detached OS process spawning (Setsid) & PID monitoring
+│   │   └── fifo.go             # POSIX named pipe key writer goroutine
 │   ├── schema/               # Startup schema & trigger validation engine
 │   ├── seed/                 # Snapshot seeding & bootstrap retention pins
 │   ├── store/                # MariaDB metadata store & transaction manager
@@ -720,61 +673,17 @@ import (
     "go.uber.org/zap/zapcore"
 )
 
-// TransportKind identifies cross-domain air-gap transport adapters.
-type TransportKind string
-
-const (
-    TransportDirectory TransportKind = "directory"
-    TransportHTTP      TransportKind = "http"
-    TransportHTTPS     TransportKind = "https"
-    TransportSFTP      TransportKind = "sftp"
-    TransportS3        TransportKind = "s3"
-)
-
-// HighLowTransportConfig configures the air-gap staging transport.
-type HighLowTransportConfig struct {
-    Kind        TransportKind
-    Endpoint    string // e.g. "dir:///var/spool/airgap" or "https://drop.example.com"
-    Username    string
-    Password    string
-    BearerToken string
-    S3Bucket    string
-    S3Region    string
-}
-
-// LowRoleConfig configures the Low-side exporter.
-type LowRoleConfig struct {
-    StreamID               string
-    UploadInterval         time.Duration
-    RecipientRSAKeyPEM     string // Public RSA key of High node
-    RecipientKeyID         string
-    SenderSigningKeyHex    string // Ed25519 private signing key
-    SenderKeyID            string
-}
-
-// HighRoleConfig configures the High-side importer.
-type HighRoleConfig struct {
-    AcceptedStreamIDs      []string
-    FetchInterval          time.Duration
-    RecipientPrivateKeyPEM string // Private RSA key of High node
-    SenderPublicKeys       map[string]string // Ed25519 public keys keyed by sender_key_id
-}
-
-// ControlAPIConfig configures the dedicated High/Low mTLS management API.
-type ControlAPIConfig struct {
-    ListenAddr      string
-    ServerCertPEM   string
-    ServerKeyPEM    string
-    ClientCACertPEM string
-}
-
-// HighLowConfig configures the complete High/Low cross-domain subsystem.
-type HighLowConfig struct {
-    Enabled    bool
-    Low        *LowRoleConfig
-    High       *HighRoleConfig
-    Transport  *HighLowTransportConfig
-    ControlAPI *ControlAPIConfig
+// ProcessConfig controls the MariaDB daemon lifecycle, configuration enforcement, and key handshake.
+type ProcessConfig struct {
+    AutoStart         bool          // Auto-start MariaDB if not running
+    AutoEnforceConfig bool          // Auto-discover, validate, and edit MariaDB config file
+    BinaryPath        string        // Path to mariadbd/mysqld binary
+    ConfigFile        string        // Path to my.cnf / mariadb.cnf (auto-discovered if empty)
+    ConfigDropInDir   string        // Drop-in directory for 99-mariamesh.cnf (e.g. /etc/mysql/mariadb.conf.d)
+    SocketPath        string        // Path to UNIX domain socket
+    FIFODir           string        // Directory for key FIFO named pipe
+    DecryptionKey     []byte        // Encryption key for file_key_management
+    StartupTimeout    time.Duration // Max time to wait for DB readiness
 }
 
 // LogConfig configures the unified Zap + timberlog logger.
@@ -785,17 +694,6 @@ type LogConfig struct {
     RotateUTC   string        // Daily rotation schedule in UTC (default: "00:00")
     Level       zapcore.Level // Minimum log level
     Development bool          // Enable console output alongside file logs
-}
-
-// ProcessConfig controls the MariaDB daemon lifecycle and key handshake.
-type ProcessConfig struct {
-    AutoStart      bool          // Auto-start MariaDB if not running
-    BinaryPath     string        // Path to mariadbd/mysqld binary
-    ConfigFile     string        // Path to my.cnf
-    SocketPath     string        // Path to UNIX domain socket
-    FIFODir        string        // Directory for key FIFO named pipe
-    DecryptionKey  []byte        // Encryption key for file_key_management
-    StartupTimeout time.Duration // Max time to wait for DB readiness
 }
 
 // Config defines the complete replicator configuration.
@@ -820,7 +718,7 @@ type Replicator struct { /* ... */ }
 // New creates a new Replicator instance.
 func New(cfg Config) (*Replicator, error)
 
-// Start initializes MariaDB (if needed), validates schema, and launches mesh + High/Low workers.
+// Start initializes config enforcement, MariaDB daemon (if needed), validates schema, and launches workers.
 func (r *Replicator) Start(ctx context.Context) error
 
 // Close gracefully stops replication and workers. MariaDB daemon continues running.
@@ -837,12 +735,6 @@ func (r *Replicator) AlterTable(ctx context.Context, table Table, ddlSQL string)
 
 // Validate verifies that registered tables, columns, PKs, and triggers match requirements.
 func (r *Replicator) Validate(ctx context.Context) error
-
-// TriggerReplay queues a historical event replay on a Low node.
-func (r *Replicator) TriggerReplay(ctx context.Context, scope string, sinceUTC string) error
-
-// HighLowProvenance queries row origin and High-owned fields on a High node.
-func (r *Replicator) HighLowProvenance(ctx context.Context, table string, pk map[string]any) (map[string]any, error)
 ```
 
 ---
@@ -856,7 +748,9 @@ func (r *Replicator) HighLowProvenance(ctx context.Context, table string, pk map
    - Implement Zap core integration with `timberlog` rolling write syncer.
    - Configure daily rotation at 00:00 UTC, default 100MB file size, and 30-day retention pruning.
    - Route all package subsystem log emitters into the unified logger.
-3. **Phase 3: MariaDB Process Manager & FIFO Key Provisioner**
+3. **Phase 3: MariaDB Config Auto-Discovery, Enforcement & Process Manager**
+   - Implement configuration file discovery (`ProcessConfig.ConfigFile`, standard paths, binary introspection).
+   - Implement INI parsing, backup creation, and automated file editing/enforcement (encryption, FIFO plugin, InnoDB invariants).
    - Implement MariaDB running detection (PID, UNIX socket, TCP probe).
    - Implement FIFO creation (`mkfifo 0600`) and background key writer goroutine.
    - Implement detached daemon execution (`Setsid: true`) and readiness polling.
